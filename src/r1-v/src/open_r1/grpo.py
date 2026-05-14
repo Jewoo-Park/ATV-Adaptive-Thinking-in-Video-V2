@@ -48,6 +48,41 @@ class GRPOVideoScriptArguments(ScriptArguments):
         default="length",
         metadata={"help": "Strict output task mode: length or perspective. Do not mix modes in one run."},
     )
+    balanced_strategy_rollout: bool = field(
+        default=False,
+        metadata={
+            "help": "If true, force each prompt's num_generations rollouts to be split evenly across the "
+            "three strategies of reasoning_task_type (LENGTH: direct/cot/long_cot, "
+            "PERSPECTIVE: abstract/temporal/spatiotemporal) and apply strategy-relative reward shaping. "
+            "Requires num_generations == 3 * rollouts_per_strategy."
+        },
+    )
+    rollouts_per_strategy: int = field(
+        default=3,
+        metadata={"help": "Rollouts per strategy when balanced_strategy_rollout=true. num_generations must equal 3 * this."},
+    )
+    strategy_bonus_scale: float = field(
+        default=0.1,
+        metadata={"help": "Alpha multiplier for strategy bonus: final = base + alpha * (strategy_mean - mean(strategy_means))."},
+    )
+    strategy_bonus_threshold: float = field(
+        default=0.34,
+        metadata={
+            "help": "If (best_strategy_mean - second_best_strategy_mean) < threshold for a prompt group, "
+            "skip the bonus for that group and use base reward as final reward."
+        },
+    )
+    log_strategy_metrics: bool = field(
+        default=True,
+        metadata={"help": "Log per-strategy mean reward, bonus-applied rate, and best-strategy distribution."},
+    )
+    strategy_debug_log_path: str = field(
+        default="",
+        metadata={
+            "help": "If set and balanced rollout is on, write a per-rollout debug JSONL "
+            "(forced strategy, parsed tag, base/final reward, advantage) at each step."
+        },
+    )
 
 
 GRPOScriptArguments = GRPOVideoScriptArguments
@@ -313,7 +348,7 @@ def main(script_args, training_args, model_args):
     dataset = dataset.map(make_conversation_video)
 
     trainer_cls = Qwen2VLGRPOTrainer if not training_args.use_vllm else Qwen2VLGRPOVLLMTrainerModified
-    trainer = trainer_cls(
+    trainer_kwargs = dict(
         model=model_args.model_name_or_path,
         reward_funcs=reward_funcs,
         args=training_args,
@@ -325,6 +360,21 @@ def main(script_args, training_args, model_args):
         min_pixels=script_args.min_pixels,
         reward_weights=reward_weights,
     )
+    if training_args.use_vllm:
+        trainer_kwargs.update(
+            reasoning_task_type=reasoning_task_type,
+            balanced_strategy_rollout=script_args.balanced_strategy_rollout,
+            rollouts_per_strategy=script_args.rollouts_per_strategy,
+            strategy_bonus_scale=script_args.strategy_bonus_scale,
+            strategy_bonus_threshold=script_args.strategy_bonus_threshold,
+            log_strategy_metrics=script_args.log_strategy_metrics,
+            strategy_debug_log_path=script_args.strategy_debug_log_path,
+        )
+    elif script_args.balanced_strategy_rollout:
+        raise ValueError(
+            "balanced_strategy_rollout=true requires use_vllm=true (only the vLLM trainer path supports it)."
+        )
+    trainer = trainer_cls(**trainer_kwargs)
 
     # GRPOConfig inherits TrainingArguments, which already defines --resume_from_checkpoint (do not duplicate on ScriptArguments).
     resume_ckpt = getattr(training_args, "resume_from_checkpoint", None)

@@ -13,6 +13,9 @@ wandb/
 runs/
 cache/
 tmp/
+models/
+memory/
+.claude/
 
 *.pt
 *.pth

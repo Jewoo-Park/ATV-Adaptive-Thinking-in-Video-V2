@@ -3,6 +3,8 @@
 `Qwen2.5-VL-7B-Instruct`를 백본으로, **SFT(LoRA) → SFT merge → GRPO(LoRA) → GRPO merge → 벤치마크 추론** 순서의 연구 파이프라인을 담은 레포입니다.  
 GRPO는 `Video-R1` 계열 데이터를 공통 JSONL 포맷으로 두고, `open_r1` 기반 비디오 GRPO(`grpo_video`)와 vLLM 롤아웃을 사용합니다.
 
+GRPO 단계는 옵션으로 **balanced strategy rollout**을 지원합니다. 한 prompt의 `num_generations`개 rollout을 strategy별(LENGTH: direct / cot / long_cot, PERSPECTIVE: abstract / temporal / spatiotemporal)로 균등 분배하고, 같은 prompt group 안에서 strategy 평균 reward를 비교해 final reward를 만들어 GRPO advantage에 넣습니다. 자세한 내용은 §5-8 참조.
+
 YAML·스크립트 파일명에 남아 있는 `3b` 표기는 과거 명명이며, **실제 기본 설정은 7B 모델**입니다.
 
 ---
@@ -15,7 +17,7 @@ YAML·스크립트 파일명에 남아 있는 `3b` 표기는 과거 명명이며
 |------|------|------|------|
 | **SFT** | Dataset 1 (length) 또는 Dataset 2 (perspective) JSONL + 프레임 | LoRA 어댑터 (`sft/outputs/qwen25vl7b_lora_sft_*`) | `sft/scripts/run_train.sh` 등 |
 | **SFT merge** | 백본 HF 가중치 + SFT LoRA | merge된 전체 가중치 (`…/qwen25vl7b_lora_merged_*`, 대용량은 scratch 권장) | `remap_adapter_keys: true` |
-| **GRPO** | merge 모델 + Video-R1 GRPO train JSONL | GRPO LoRA (`src/r1-v/outputs/…`) | vLLM + DeepSpeed, LoRA만 저장 |
+| **GRPO** | merge 모델 + Video-R1 GRPO train JSONL | GRPO LoRA (`src/r1-v/outputs/…`) | vLLM + DeepSpeed, LoRA만 저장. **옵션: balanced strategy rollout** (§5-8) |
 | **GRPO merge** | SFT merge 모델 + GRPO LoRA | 최종 추론용 merge 모델 | `merge_lora_grpo_*.yaml` |
 | **테스트** | 최종(또는 중간) 모델 + 벤치 JSONL | `test_predictions.jsonl` 등 | UVB / VideoMMMU / MMVU |
 
@@ -274,6 +276,115 @@ python scripts/merge_lora.py --config configs/merge_lora_grpo_length.yaml
 
 `merge_lora_grpo_length.yaml` / `merge_lora_grpo_perspective.yaml`에서 `adapter_name_or_path`, `export_dir`를 실제 출력 디렉터리에 맞게 수정합니다.
 
+### 5-8. Balanced strategy rollout (옵션)
+
+기본 GRPO는 한 prompt에서 `num_generations`개 rollout을 자유롭게 생성하므로, 모델이 특정 strategy 하나로 collapse하면 strategy 간 비교 신호가 사라집니다. balanced strategy rollout은 이를 막기 위해 **한 prompt의 G개 rollout slot을 strategy별로 균등 분배**해 강제 생성하고, 같은 prompt group 내에서 strategy 평균 reward를 비교해 final reward로 GRPO advantage를 계산합니다.
+
+#### 5-8-1. 동작 흐름
+
+| 단계 | 내용 |
+|------|------|
+| **slot plan 결정** | `reasoning_task_type`에 따라 strategy 3종이 정해지고, G(=`num_generations`)개 slot을 `k=rollouts_per_strategy`개씩 strategy당 동일하게 배분. 기본은 G=9, k=3 → LENGTH는 `[direct×3, cot×3, long_cot×3]`, PERSPECTIVE는 `[abstract×3, temporal×3, spatiotemporal×3]` |
+| **prompt 확장** | `_prepare_inputs`에서 입력 B개를 prompt-major 순서로 `B×G`개로 복제(같은 prompt의 G slot이 연속). 각 slot의 system prompt 끝에 strategy directive를 append. user content / 영상 frame은 손대지 않음 |
+| **vLLM 생성** | balanced 모드에선 `sampling_params.n=1`로 B×G prompt를 한 번에 호출 (free 모드는 기존대로 `n=G`로 B prompt 호출) |
+| **base reward** | 기존 reward 함수(`answer_accuracy` + `answer_format`)를 그대로 사용. shape는 `(B×G,)` |
+| **strategy bonus** | 같은 prompt group(연속 G개) 안에서 strategy별 평균 reward 계산. `bonus = strategy_mean - mean(strategy_means)`, `(best − second_best) >= threshold`일 때만 적용. `final = base + α × bonus` |
+| **advantage** | 기존 GRPO 식 `(rewards − mean) / (std + 1e-4)`을 그대로 사용하되, `rewards`가 base 대신 final로 들어감. `compute_loss` / KL / clipping / logprob 경로는 **건드리지 않음** |
+
+핵심: balanced 모드에서도 `rewards.view(-1, num_generations)`가 그대로 동작합니다. prompt-major 순서 덕분에 G slot이 한 row(같은 prompt)로 묶이기 때문입니다.
+
+#### 5-8-2. 새 옵션 (모두 default OFF / no-op)
+
+[src/r1-v/src/open_r1/grpo.py](src/r1-v/src/open_r1/grpo.py)의 `GRPOVideoScriptArguments`:
+
+| 인자 | 기본값 | 설명 |
+|------|--------|------|
+| `--balanced_strategy_rollout` | `false` | 마스터 스위치. true일 때만 아래 옵션이 의미를 가짐. `use_vllm=true`가 함께 켜져야 함 |
+| `--rollouts_per_strategy` | `3` | strategy당 rollout 수. `num_generations == 3 × rollouts_per_strategy`이어야 하며, 불일치 시 학습 시작 전에 `ValueError` |
+| `--strategy_bonus_scale` | `0.1` | α. final = base + α × strategy_bonus |
+| `--strategy_bonus_threshold` | `0.34` | margin gate. best와 second-best 평균 차이가 이 값보다 작으면 그 group은 bonus 미적용, `final == base` |
+| `--log_strategy_metrics` | `true` | `strategy/*` 메트릭 emit 여부 |
+| `--strategy_debug_log_path` | `""` | 비어있지 않으면 step별 slot 단위 디버그 JSONL을 append (main process만) |
+| `--reasoning_task_type` | `length` | `length` 또는 `perspective`. strategy set 결정 |
+
+balanced=false면 기존 free rollout 경로 그대로 동작합니다 (회귀 안전성은 verify 스크립트로 검증됨).
+
+#### 5-8-3. 사용 예
+
+```bash
+# LENGTH 모드 balanced
+python src/r1-v/src/open_r1/grpo.py \
+  --train_file "$TRAIN_FILE" \
+  --model_name_or_path "$QWEN_PATH" \
+  --output_dir "$OUTPUT_DIR" \
+  --reasoning_task_type length \
+  --balanced_strategy_rollout true \
+  --rollouts_per_strategy 3 \
+  --num_generations 9 \
+  --strategy_bonus_scale 0.1 \
+  --strategy_bonus_threshold 0.34 \
+  --log_strategy_metrics true \
+  --strategy_debug_log_path "$OUTPUT_DIR/strategy_debug.jsonl" \
+  --use_vllm true ...
+
+# PERSPECTIVE 모드 balanced: --reasoning_task_type perspective 로 바꿈
+```
+
+`run_grpo_answer_only_lora.sh`에서 환경변수로 전달하려면 다음 env들을 스크립트에 노출시킨 뒤 동일하게 호출하면 됩니다.
+
+#### 5-8-4. 로그 키
+
+`log_strategy_metrics=true`일 때 trainer metrics에 다음이 추가로 찍힙니다.
+
+공통:
+- `strategy/base_mean`, `strategy/final_mean`
+- `strategy/strategy_bonus_applied_rate`, `strategy/strategy_margin_mean`
+
+LENGTH:
+- `strategy/mean_reward_direct`, `strategy/mean_reward_cot`, `strategy/mean_reward_long_cot`
+- `strategy/best_strategy_direct_rate`, `strategy/best_strategy_cot_rate`, `strategy/best_strategy_long_cot_rate`, `strategy/best_strategy_tie_or_unclear_rate`
+
+PERSPECTIVE:
+- `strategy/mean_reward_abstract`, `strategy/mean_reward_temporal`, `strategy/mean_reward_spatiotemporal`
+- `strategy/best_strategy_abstract_rate`, `strategy/best_strategy_temporal_rate`, `strategy/best_strategy_spatiotemporal_rate`, `strategy/best_strategy_tie_or_unclear_rate`
+
+`best_strategy_*` 합계는 margin gate를 통과한 그룹만 카운트하므로, 4개 키의 합이 항상 1.0이며 `tie_or_unclear_rate`가 margin gate를 통과 못 한 비율입니다.
+
+#### 5-8-5. 디버그 JSONL
+
+`--strategy_debug_log_path /path/to/strategy_debug.jsonl`을 주면 step마다 slot 1개당 row 1개씩 append됩니다. 필드:
+
+```
+step, prompt_idx, slot_idx,
+forced_strategy, parsed_reasoning_tag, parsed_strategy, parsed_answer, format_ok,
+base_reward, strategy_mean, margin, bonus_applied, final_reward,
+advantage, best_strategy_in_group,
+completion_preview
+```
+
+`forced_strategy == parsed_strategy && format_ok == true` 비율로 모델이 directive를 얼마나 따르는지 추적할 수 있습니다.
+
+#### 5-8-6. 검증 스크립트 (GPU 불필요)
+
+```bash
+# 기본 dry-run (14개 항목)
+python src/scripts/dry_run_balanced_strategy.py
+
+# 종합 verify (90+ assert: 정적 코드 점검, plan ordering, directive 주입,
+# B×G 확장 시뮬레이션, sampling_n 길이표, reward shaping 수식,
+# logging keys, debug JSONL row 포맷, strict parser, regression 안전성)
+python src/scripts/verify_balanced_strategy_rollout.py
+```
+
+두 스크립트 모두 transformers/vLLM/CUDA 없이 실행됩니다. 메인 검증 로직은 [`src/r1-v/src/open_r1/strategy.py`](src/r1-v/src/open_r1/strategy.py)와 [`vllm_grpo_trainer_modified.py`](src/r1-v/src/open_r1/trainer/vllm_grpo_trainer_modified.py)의 reward shaping 부분에 집중되어 있습니다.
+
+#### 5-8-7. 주의사항
+
+- balanced 모드는 `use_vllm=true`가 필수입니다. HF generation 경로는 미지원이며, false 상태에서 `--balanced_strategy_rollout true`를 주면 즉시 `ValueError`.
+- `num_generations`는 반드시 strategy 수(현재 3) × `rollouts_per_strategy`와 일치해야 합니다. 그 외 값은 trainer `__init__`에서 거부됩니다.
+- PERSPECTIVE 모드에서 `<ANSWER>X</ANSWER>` 단독 출력은 strict parser상 `format_ok=True`로 통과합니다 ([strict_answer.py:108-116](src/r1-v/src/open_r1/strict_answer.py#L108-L116)의 answer-only 분기). 모델이 강제 directive를 무시하고 answer-only로 collapse할 수 있어, 학습 초반에는 debug JSONL의 `parsed_strategy == None` 비율을 함께 모니터링하는 것이 좋습니다. 필요 시 parser를 PERSPECTIVE에서 answer-only를 거부하도록 한 줄 추가하면 됩니다.
+- 단일 process(`NUM_GPUS=1`) 환경에선 debug JSONL이 모든 slot을 다 캡처하지만, DDP 환경에서는 main process가 본 local prompt의 completion만 채워집니다. 전체를 보고 싶다면 batch_size=1, single-process로 1 step만 돌리는 것을 권장합니다.
+
 ---
 
 ## 6. 테스트 (세 벤치마크 추론)
@@ -303,14 +414,19 @@ VideoMMMU / MMVU도 각각:
 2. **SFT**: `run_setup_sft.sh` → `hpc_activate_sft.sh` → `run_train.sh` (length / perspective)  
 3. **SFT merge**: `run_merge.sh` 또는 `merge_lora.py` (필요 시 scratch `export_dir`)  
 4. **GRPO**: `run_setup_grpo.sh` → `hpc_activate_grpo.sh` → `run_grpo_answer_only_lora.sh` (`QWEN_PATH`, `QWEN_BASE_PATH`)  
+   - (옵션) **balanced strategy rollout**을 켜려면 §5-8 참고. GPU 없이는 `dry_run_balanced_strategy.py` / `verify_balanced_strategy_rollout.py`로 회로 검증 가능  
 5. **GRPO merge**: `merge_lora_grpo_*.yaml`  
 6. **평가**: 세 `*_grpo_test.jsonl`에 대해 추론 실행  
 
 ---
 
-## 8. 관련 문서
+## 8. 관련 문서·코드
 
 - [`sft/README.md`](sft/README.md) — SFT·merge 상세  
 - [`merge_readme.md`](merge_readme.md) — merge 절차 보조  
 - [`QUICKSTART.md`](QUICKSTART.md) — 빠른 참고  
-- [`src/eval/README.md`](src/eval/README.md) — eval 데이터 준비(있는 경우)
+- [`src/eval/README.md`](src/eval/README.md) — eval 데이터 준비(있는 경우)  
+- [`src/r1-v/src/open_r1/strategy.py`](src/r1-v/src/open_r1/strategy.py) — balanced rollout의 strategy 정의·directive·reward shaping 순수 함수  
+- [`src/r1-v/src/open_r1/strict_answer.py`](src/r1-v/src/open_r1/strict_answer.py) — `<ANSWER>` / `<COT>` / `<LONG_COT>` / `<ABSTRACT>` / `<TEMPORAL>` / `<SPATIOTEMPORAL>` strict parser  
+- [`src/scripts/dry_run_balanced_strategy.py`](src/scripts/dry_run_balanced_strategy.py) — balanced rollout 기본 dry-run (GPU 불필요)  
+- [`src/scripts/verify_balanced_strategy_rollout.py`](src/scripts/verify_balanced_strategy_rollout.py) — 정적 코드·shape·reward shaping·logging·JSONL·regression 종합 검증 (GPU 불필요)

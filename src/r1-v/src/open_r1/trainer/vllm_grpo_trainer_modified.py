@@ -75,6 +75,15 @@ from PIL import Image
 
 from open_r1.trainer.grpo_log_utils import format_grpo_train_metrics_line
 from open_r1.trainer.qwen25_config_utils import ensure_qwen25_rope_scaling
+from open_r1.strategy import (
+    build_balanced_strategy_plan,
+    compute_strategy_bonus,
+    parsed_tag_to_strategy,
+    strategies_for_task,
+    strategy_directive,
+    strategy_distribution_rates,
+)
+from open_r1.strict_answer import parse_strict_output
 
 if is_peft_available():
     from peft import PeftConfig, PeftModel, get_peft_model
@@ -555,6 +564,14 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
         min_pixels: Optional[int] = 3136,
         attn_implementation: str = "flash_attention_2",
         reward_weights: Optional[list[float]] = None,
+        # Balanced strategy rollout (default OFF preserves legacy free-rollout behavior).
+        reasoning_task_type: str = "length",
+        balanced_strategy_rollout: bool = False,
+        rollouts_per_strategy: int = 3,
+        strategy_bonus_scale: float = 0.1,
+        strategy_bonus_threshold: float = 0.34,
+        log_strategy_metrics: bool = True,
+        strategy_debug_log_path: str = "",
     ):
 
         # Args
@@ -801,6 +818,38 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
             pad_token_id=pad_token_id,
         )
         self.beta = args.beta
+
+        # Balanced strategy rollout state.
+        self.reasoning_task_type = str(reasoning_task_type or "length").strip().lower()
+        if self.reasoning_task_type not in {"length", "perspective"}:
+            raise ValueError("reasoning_task_type must be 'length' or 'perspective'")
+        self.balanced_strategy_rollout = bool(balanced_strategy_rollout)
+        self.rollouts_per_strategy = int(rollouts_per_strategy)
+        self.strategy_bonus_scale = float(strategy_bonus_scale)
+        self.strategy_bonus_threshold = float(strategy_bonus_threshold)
+        self.log_strategy_metrics = bool(log_strategy_metrics)
+        self.strategy_debug_log_path = str(strategy_debug_log_path or "").strip()
+        self._strategies = strategies_for_task(self.reasoning_task_type)
+        if self.balanced_strategy_rollout:
+            expected_G = len(self._strategies) * self.rollouts_per_strategy
+            if self.num_generations != expected_G:
+                raise ValueError(
+                    f"balanced_strategy_rollout requires num_generations == "
+                    f"len(strategies)*rollouts_per_strategy = {expected_G}, "
+                    f"got num_generations={self.num_generations} "
+                    f"(strategies={self._strategies}, rollouts_per_strategy={self.rollouts_per_strategy})."
+                )
+            self._strategy_plan_per_prompt = build_balanced_strategy_plan(
+                self.reasoning_task_type, self.num_generations, self.rollouts_per_strategy
+            )
+            self._strategy_index_per_slot = [
+                self._strategies.index(s) for s in self._strategy_plan_per_prompt
+            ]
+        else:
+            self._strategy_plan_per_prompt = None
+            self._strategy_index_per_slot = None
+        # Step-local strategy ids (set by _prepare_inputs, consumed by reward shaping/logging).
+        self._step_strategy_ids_local: Optional[list[int]] = None
 
         # The trainer estimates the number of FLOPs (floating-point operations) using the number of elements in the
         # input tensor associated with the key "input_ids". However, in GRPO, the sampled data does not include the
@@ -1295,18 +1344,203 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
             per_token_logps.append(row)
         return torch.stack(per_token_logps)
 
+    def _apply_strategy_bonus(self, base_rewards: torch.Tensor):
+        """Thin wrapper around strategy.compute_strategy_bonus using trainer-bound config."""
+        return compute_strategy_bonus(
+            base_rewards=base_rewards,
+            strategy_index_per_slot=self._strategy_index_per_slot,
+            num_strategies=len(self._strategies),
+            bonus_scale=self.strategy_bonus_scale,
+            bonus_threshold=self.strategy_bonus_threshold,
+        )
+
+    def _log_strategy_distribution(
+        self,
+        key_prefix: str,
+        chosen_idx: torch.Tensor,
+        clear_mask: torch.Tensor,
+    ) -> None:
+        """Append a strategy distribution under `strategy/<key_prefix>_*` keys.
+
+        Reusable for `best_strategy` (current, margin-gated) and `selected_strategy`
+        (future free-choice mode, ungated). Math lives in strategy.strategy_distribution_rates.
+        """
+        rates = strategy_distribution_rates(
+            strategies=self._strategies,
+            chosen_idx_per_group=chosen_idx,
+            clear_mask_per_group=clear_mask,
+            key_prefix=key_prefix,
+        )
+        for k, v in rates.items():
+            self._metrics[f"strategy/{k}"].append(v)
+
+    def _log_strategy_metrics(self, base_rewards: torch.Tensor, strategy_log: dict) -> None:
+        base = strategy_log["base"]            # (B_total, G)
+        final = strategy_log["final"]
+        strategy_mean = strategy_log["strategy_mean"]  # (B_total, S)
+        margin = strategy_log["margin"]
+        apply_mask = strategy_log["apply_mask"]
+        best_idx = strategy_log["best_idx"]
+        B_total, S = strategy_mean.shape
+
+        # Headline aggregates.
+        self._metrics["strategy/base_mean"].append(float(base.mean().item()))
+        self._metrics["strategy/final_mean"].append(float(final.mean().item()))
+        self._metrics["strategy/strategy_bonus_applied_rate"].append(
+            float(apply_mask.mean().item())
+        )
+        self._metrics["strategy/strategy_margin_mean"].append(float(margin.mean().item()))
+
+        # Per-strategy average reward across all prompt groups in this step.
+        per_strategy_mean = strategy_mean.mean(dim=0)  # (S,)
+        for s_idx, s_name in enumerate(self._strategies):
+            self._metrics[f"strategy/mean_reward_{s_name}"].append(
+                float(per_strategy_mean[s_idx].item())
+            )
+
+        # Best-strategy distribution, gated by margin threshold:
+        #   only count the argmax as the "best" when (best - second_best) >= threshold;
+        #   otherwise the group is tie_or_unclear.
+        self._log_strategy_distribution(
+            key_prefix="best_strategy",
+            chosen_idx=best_idx,
+            clear_mask=apply_mask,
+        )
+
+    def _write_strategy_debug_jsonl(
+        self,
+        base_rewards: torch.Tensor,
+        final_rewards: torch.Tensor,
+        advantages_global: torch.Tensor,
+        completions,
+        strategy_log: dict,
+    ) -> None:
+        """Per-rollout debug JSONL. Main process only, global (gathered) view."""
+        import json as _json
+
+        os.makedirs(os.path.dirname(self.strategy_debug_log_path) or ".", exist_ok=True)
+        G = self.num_generations
+        S = len(self._strategies)
+        total = base_rewards.numel()
+        B_total = total // G
+        plan = self._strategy_plan_per_prompt or []
+
+        base = strategy_log["base"].detach().cpu()
+        final = strategy_log["final"].detach().cpu()
+        strategy_mean = strategy_log["strategy_mean"].detach().cpu()
+        margin = strategy_log["margin"].detach().cpu()
+        apply_mask = strategy_log["apply_mask"].detach().cpu()
+        best_idx = strategy_log["best_idx"].detach().cpu()
+        adv = advantages_global.detach().cpu().view(B_total, G)
+
+        # completions are local-process only; on multi-process runs this debug log captures the
+        # local slice. For batch_size=1, single-process dry-runs (the intended sanity setup),
+        # local == global.
+        local_count = min(len(completions), B_total * G)
+        step = int(self.state.global_step)
+
+        with open(self.strategy_debug_log_path, "a", encoding="utf-8") as f:
+            for prompt_idx in range(B_total):
+                for slot_idx in range(G):
+                    flat_idx = prompt_idx * G + slot_idx
+                    forced = plan[slot_idx] if slot_idx < len(plan) else None
+                    completion_text = ""
+                    if flat_idx < local_count:
+                        c = completions[flat_idx]
+                        if isinstance(c, list) and c and isinstance(c[0], dict):
+                            completion_text = c[0].get("content", "")
+                        else:
+                            completion_text = str(c)
+                    parsed = parse_strict_output(completion_text, task_type=self.reasoning_task_type)
+                    parsed_strategy = parsed_tag_to_strategy(self.reasoning_task_type, parsed.reasoning_tag)
+                    row = {
+                        "step": step,
+                        "prompt_idx": prompt_idx,
+                        "slot_idx": slot_idx,
+                        "forced_strategy": forced,
+                        "parsed_reasoning_tag": parsed.reasoning_tag,
+                        "parsed_strategy": parsed_strategy,
+                        "parsed_answer": parsed.pred_letter,
+                        "format_ok": bool(parsed.format_ok),
+                        "base_reward": float(base[prompt_idx, slot_idx].item()),
+                        "strategy_mean": float(
+                            strategy_mean[prompt_idx, self._strategies.index(forced)].item()
+                        )
+                        if forced in self._strategies
+                        else None,
+                        "margin": float(margin[prompt_idx].item()),
+                        "bonus_applied": bool(apply_mask[prompt_idx].item() > 0.5),
+                        "final_reward": float(final[prompt_idx, slot_idx].item()),
+                        "advantage": float(adv[prompt_idx, slot_idx].item()),
+                        "best_strategy_in_group": self._strategies[int(best_idx[prompt_idx].item())],
+                        "completion_preview": completion_text[:200],
+                    }
+                    f.write(_json.dumps(row, ensure_ascii=False) + "\n")
+
+    def _inject_strategy_into_prompt(self, prompt_messages: list, strategy: str) -> list:
+        """Append a strategy directive to the system message; user content untouched."""
+        directive = strategy_directive(self.reasoning_task_type, strategy)
+        new_msgs = copy.deepcopy(prompt_messages)
+        if not new_msgs:
+            return new_msgs
+        sys_msg = new_msgs[0]
+        if not (isinstance(sys_msg, dict) and sys_msg.get("role") == "system"):
+            new_msgs.insert(
+                0,
+                {"role": "system", "content": [{"type": "text", "text": directive}]},
+            )
+            return new_msgs
+        content = sys_msg.get("content")
+        if isinstance(content, list):
+            appended = False
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    part["text"] = (part.get("text", "") or "") + "\n\n" + directive
+                    appended = True
+                    break
+            if not appended:
+                content.append({"type": "text", "text": directive})
+        elif isinstance(content, str):
+            sys_msg["content"] = (content or "") + "\n\n" + directive
+        else:
+            sys_msg["content"] = [{"type": "text", "text": directive}]
+        return new_msgs
+
     # Trainer "prepares" the inputs before calling `compute_loss`. It converts to tensor and move to device.
     # Since we preprocess the data in `compute_loss`, we need to override this method to skip this step.
     def _prepare_inputs(
         self, inputs: dict[str, Union[torch.Tensor, Any]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
         device = self.accelerator.device
-        prompts = [x["prompt"] for x in inputs]
+
+        # Balanced strategy rollout: expand B inputs into B*G prompt-major slots, each with a
+        # strategy-specific system-prompt directive. vLLM is then called with n=1, and downstream
+        # group structure (rewards.view(-1, num_generations)) is preserved because consecutive G
+        # slots come from the same original prompt.
+        if self.balanced_strategy_rollout:
+            _sampling_n = 1
+            effective_inputs: list = []
+            strategy_ids_local: list[int] = []
+            for example in inputs:
+                base_prompt = example.get("prompt", [])
+                for slot_idx in range(self.num_generations):
+                    strategy = self._strategy_plan_per_prompt[slot_idx]
+                    ex_copy = copy.deepcopy(example)
+                    ex_copy["prompt"] = self._inject_strategy_into_prompt(base_prompt, strategy)
+                    effective_inputs.append(ex_copy)
+                    strategy_ids_local.append(self._strategy_index_per_slot[slot_idx])
+            self._step_strategy_ids_local = strategy_ids_local
+        else:
+            _sampling_n = self.num_generations
+            effective_inputs = inputs
+            self._step_strategy_ids_local = None
+
+        prompts = [x["prompt"] for x in effective_inputs]
         # Build reduced-frame examples first so chat template placeholder count
         # matches the actual number of frames passed to the processor.
         normalized_examples = []
         images = []
-        for example in inputs:
+        for example in effective_inputs:
             reduced = self._load_image_item(example["image_vllm"])
             if isinstance(reduced, Image.Image):
                 reduced = [reduced]
@@ -1420,7 +1654,7 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
             if self.accelerator.is_main_process:
                 # Clone to avoid modifying original params
                 sampling_params = copy.deepcopy(self.sampling_params)
-                sampling_params.n = self.num_generations
+                sampling_params.n = _sampling_n
                 # Single generate call with all prompts
                 outputs = []
                 with _temporary_cuda_device(self._vllm_device or "auto"):
@@ -1440,13 +1674,13 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                 # Flatten outputs: [prompt1_gen1, prompt1_gen2, ..., prompt2_gen1, prompt2_gen2, ...]
                 completion_ids = [out.token_ids for completion in outputs for out in completion.outputs]
             else:
-                completion_ids = [None] * len(all_multimodal_inputs) * self.num_generations
-            
+                completion_ids = [None] * len(all_multimodal_inputs) * _sampling_n
+
             # broadcast and slice
             completion_ids = broadcast_object_list(completion_ids, from_process=0)
             process_slice = slice(
-                self.accelerator.process_index * len(prompts) * self.num_generations,
-                (self.accelerator.process_index + 1) * len(prompts) * self.num_generations,
+                self.accelerator.process_index * len(prompts) * _sampling_n,
+                (self.accelerator.process_index + 1) * len(prompts) * _sampling_n,
             )
             completion_ids = completion_ids[process_slice]
 
@@ -1455,13 +1689,13 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
             completion_ids = pad(
                 completion_ids, padding_value=self.processing_class.pad_token_id
             )
-            prompt_ids = prompt_ids.repeat_interleave(self.num_generations, dim=0)
+            prompt_ids = prompt_ids.repeat_interleave(_sampling_n, dim=0)
             prompt_completion_ids = torch.cat([prompt_ids, completion_ids], dim=1)
 
             prompt_length = prompt_ids.size(1)
             prompt_ids = prompt_completion_ids[:, :prompt_length]
             completion_ids = prompt_completion_ids[:, prompt_length:]
-            prompt_mask = prompt_mask.repeat_interleave(self.num_generations, dim=0)
+            prompt_mask = prompt_mask.repeat_interleave(_sampling_n, dim=0)
         else:
             raise ValueError("Only vLLM generation is supported in this version ")
 
@@ -1477,9 +1711,10 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
         # Concatenate prompt_mask with completion_mask for logit computation
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B*G, P+C)
 
-        # Repeat visual inputs for each sampled completion (B -> B * num_generations).
-        pixel_values = prompt_inputs["pixel_values"].repeat_interleave(self.num_generations, dim=0)
-        image_grid_thw = prompt_inputs["image_grid_thw"].repeat_interleave(self.num_generations, dim=0)
+        # Repeat visual inputs for each sampled completion (B -> B * _sampling_n).
+        # In balanced mode prompt_inputs already has B*G rows, so _sampling_n=1 keeps it correct.
+        pixel_values = prompt_inputs["pixel_values"].repeat_interleave(_sampling_n, dim=0)
+        image_grid_thw = prompt_inputs["image_grid_thw"].repeat_interleave(_sampling_n, dim=0)
         logits_to_keep = completion_ids.size(1)
 
         with torch.inference_mode():
@@ -1514,7 +1749,7 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
             ]
 
         # Compute the rewards
-        prompts = [prompt for prompt in prompts for _ in range(self.num_generations)]
+        prompts = [prompt for prompt in prompts for _ in range(_sampling_n)]
         rewards_per_func = torch.zeros(
             len(prompts), len(self.reward_funcs), device=device
         )
@@ -1541,16 +1776,16 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                 with torch.inference_mode():
                     rewards_per_func[:, i] = reward_func(**reward_inputs).logits[:, 0]  # Shape (B*G,)
             else:
-                # Repeat all input columns (but "prompt" and "completion") to match the number of generations
+                # Repeat all input columns (but "prompt" and "completion") to match the number of generations.
+                # In balanced mode effective_inputs already has B*G entries, so _sampling_n=1 keeps total at B*G.
                 reward_kwargs = {
                     key: []
                     for key in inputs[0].keys()
                     if key not in ["prompt", "completion"]
                 }
                 for key in reward_kwargs:
-                    for example in inputs:
-                        # Repeat each value in the column for `num_generations` times
-                        reward_kwargs[key].extend([example[key]] * self.num_generations)
+                    for example in effective_inputs:
+                        reward_kwargs[key].extend([example[key]] * _sampling_n)
                 output_reward_func = reward_func(
                     prompts=prompts, completions=completions, **reward_kwargs
                 )
@@ -1561,10 +1796,18 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
         reward_weights = torch.tensor(
             self.reward_weights, dtype=rewards_per_func.dtype, device=rewards_per_func.device
         )
-        # Weighted sum of rewards from all reward functions
+        # Weighted sum of rewards from all reward functions (base reward, shape (B_total*G,)).
         rewards = (rewards_per_func * reward_weights.unsqueeze(0)).sum(dim=1)
+        base_rewards = rewards.clone()
 
-        # Compute grouped-wise rewards
+        # Strategy-relative reward shaping (only when balanced rollout is on).
+        # Applied INSIDE the same prompt group; the GRPO loss/KL/clipping path is untouched.
+        if self.balanced_strategy_rollout:
+            rewards, _strategy_log = self._apply_strategy_bonus(rewards)
+        else:
+            _strategy_log = None
+
+        # Compute grouped-wise rewards (uses final reward when balanced, base reward otherwise).
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
         std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
 
@@ -1576,6 +1819,7 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
             self.num_generations, dim=0
         )
         advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
+        advantages_global = advantages
 
         # Slice to keep only the local part of the data
         process_slice = slice(
@@ -1596,6 +1840,22 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
 
         self._metrics["reward"].append(rewards.mean().item())
         self._metrics["reward_std"].append(std_grouped_rewards.mean().item())
+
+        if self.balanced_strategy_rollout and _strategy_log is not None and self.log_strategy_metrics:
+            self._log_strategy_metrics(base_rewards, _strategy_log)
+        if (
+            self.balanced_strategy_rollout
+            and _strategy_log is not None
+            and self.strategy_debug_log_path
+            and self.accelerator.is_main_process
+        ):
+            self._write_strategy_debug_jsonl(
+                base_rewards=base_rewards,
+                final_rewards=rewards,
+                advantages_global=advantages_global,
+                completions=completions,
+                strategy_log=_strategy_log,
+            )
 
         return {
             "prompt_ids": prompt_ids,
