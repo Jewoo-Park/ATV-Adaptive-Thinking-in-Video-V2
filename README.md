@@ -1,4 +1,4 @@
-# GRPO_Video_2
+# ATV : Adaptive Thinkin in Video
 
 `Qwen2.5-VL-7B-Instruct`를 백본으로, **SFT(LoRA) → SFT merge → GRPO(LoRA) → GRPO merge → 벤치마크 추론** 순서의 연구 파이프라인을 담은 레포입니다.  
 GRPO는 `Video-R1` 계열 데이터를 공통 JSONL 포맷으로 두고, `open_r1` 기반 비디오 GRPO(`grpo_video`)와 vLLM 롤아웃을 사용합니다.
