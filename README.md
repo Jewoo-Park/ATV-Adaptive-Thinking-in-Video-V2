@@ -227,7 +227,7 @@ source scripts/hpc_activate_grpo.sh
 export QWEN_PATH="/scratch/users/<USER>/models/qwen25vl7b_lora_merged_length"
 export QWEN_BASE_PATH="/scratch/users/<USER>/models/Qwen2.5-VL-7B-Instruct"
 export TRAIN_FILE="$(pwd)/data/video_r1/grpo/video_r1_grpo_train_strict.jsonl"
-export OUTPUT_DIR="$(pwd)/src/r1-v/outputs/video_r1_uvb_grpo_answer_only_lora"
+export REASONING_TASK_TYPE=length
 export NUM_GPUS=2
 export TRAIN_NUM_GPUS=1
 export CUDA_VISIBLE_DEVICES=0,1
@@ -235,6 +235,9 @@ export CUDA_VISIBLE_DEVICES=0,1
 bash src/scripts/run_grpo_answer_only_lora.sh
 ```
 
+`REASONING_TASK_TYPE=length`이면 기본 `OUTPUT_DIR`는 `src/r1-v/outputs/video_r1_uvb_grpo_length_answer_only_lora`,
+`REASONING_TASK_TYPE=perspective`이면 `src/r1-v/outputs/video_r1_uvb_grpo_perspective_answer_only_lora`입니다.
+PERSPECTIVE 실험은 `QWEN_PATH`도 perspective SFT merge 모델로 맞춥니다.
 로그는 기본으로 `OUTPUT_DIR/training_log.txt`에 `tee`됩니다.
 
 필요 시 이어하기:
@@ -272,9 +275,12 @@ bash src/scripts/check_environment.sh
 cd sft
 # 예: length SFT merge → GRPO 출력
 python scripts/merge_lora.py --config configs/merge_lora_grpo_length.yaml
+# perspective SFT merge → GRPO 출력
+python scripts/merge_lora.py --config configs/merge_lora_grpo_perspective.yaml
 ```
 
-`merge_lora_grpo_length.yaml` / `merge_lora_grpo_perspective.yaml`에서 `adapter_name_or_path`, `export_dir`를 실제 출력 디렉터리에 맞게 수정합니다.
+기본 config는 length/perspective GRPO adapter와 merge 산출물을 서로 다른 디렉터리로 분리합니다.
+커스텀 `OUTPUT_DIR`를 썼다면 해당 config의 `adapter_name_or_path`, `export_dir`만 맞춥니다.
 
 ### 5-8. Balanced strategy rollout (옵션)
 

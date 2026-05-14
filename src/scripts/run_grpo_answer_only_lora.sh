@@ -7,8 +7,19 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "${REPO_ROOT}/src/r1-v"
 
+REASONING_TASK_TYPE="${REASONING_TASK_TYPE:-length}"
+REASONING_TASK_TYPE="$(printf '%s' "${REASONING_TASK_TYPE}" | tr '[:upper:]' '[:lower:]')"
+case "${REASONING_TASK_TYPE}" in
+  length|perspective)
+    ;;
+  *)
+    echo "[VIDEO-GRPO-LORA] ERROR: REASONING_TASK_TYPE must be length or perspective (got ${REASONING_TASK_TYPE})" >&2
+    exit 1
+    ;;
+esac
+
 export DEBUG_MODE="true"
-export LOG_PATH="./logs/video_r1_uvb_grpo_answer_only_lora.log"
+export LOG_PATH="${LOG_PATH:-./logs/video_r1_uvb_grpo_${REASONING_TASK_TYPE}_answer_only_lora.log}"
 mkdir -p ./logs
 
 # Qwen2.5-VL vision + flash-attn rotary: assert fp32 q vs bf16 cos/sin. One-time patch of transformers in the active venv.
@@ -23,7 +34,7 @@ if [[ "${GRPO_ROTARY_HOTFIX_LC}" == "true" || "${GRPO_ROTARY_HOTFIX_LC}" == "1" 
 fi
 
 # Merged weights + clean HF tree for AutoProcessor (merged dirs often break Qwen2.5-VL processor JSON).
-QWEN_PATH="${QWEN_PATH:-/scratch/users/ntu/n2500182/models/qwen25vl7b_lora_merged_length}"
+QWEN_PATH="${QWEN_PATH:-/scratch/users/ntu/n2500182/models/qwen25vl7b_lora_merged_${REASONING_TASK_TYPE}}"
 QWEN_BASE_PATH="${QWEN_BASE_PATH:-/scratch/users/ntu/n2500182/models/Qwen2.5-VL-7B-Instruct}"
 export PROCESSOR_PATH="${PROCESSOR_PATH:-${QWEN_BASE_PATH}}"
 
@@ -62,12 +73,12 @@ EVAL_SPLIT_FILE="${EVAL_SPLIT_FILE:-${SPLIT_DIR}/video_r1_grpo_train_strict__eva
 # Optional: set GRPO_TEST_FILE to a fixed benchmark JSONL (UVB / VideoMMMU / MMVU). If unset, use eval split.
 TEST_FILE="${GRPO_TEST_FILE:-${EVAL_SPLIT_FILE}}"
 
-OUTPUT_DIR="${OUTPUT_DIR:-./outputs/video_r1_uvb_grpo_answer_only_lora}"
-RUN_NAME="${RUN_NAME:-video_r1_uvb_grpo_answer_only_lora_$(date +%Y%m%d_%H%M%S)}"
+OUTPUT_DIR="${OUTPUT_DIR:-./outputs/video_r1_uvb_grpo_${REASONING_TASK_TYPE}_answer_only_lora}"
+RUN_NAME="${RUN_NAME:-video_r1_uvb_grpo_${REASONING_TASK_TYPE}_answer_only_lora_$(date +%Y%m%d_%H%M%S)}"
 DS_CONFIG="${DS_CONFIG:-./configs/zero1_no_optimizer.json}"
 MASTER_PORT="${MASTER_PORT:-12346}"
 REPORT_TO="${REPORT_TO:-none}"
-DATASET_NAME="${DATASET_NAME:-video_r1_train_uvb_eval}"
+DATASET_NAME="${DATASET_NAME:-video_r1_train_uvb_eval_${REASONING_TASK_TYPE}}"
 TEE_TRAINING_LOG="${TEE_TRAINING_LOG:-true}"
 USE_VLLM="${USE_VLLM:-true}"
 VLLM_GPU_UTIL="${VLLM_GPU_UTIL:-0.4}"
@@ -99,7 +110,6 @@ LORA_DROPOUT="${LORA_DROPOUT:-0.05}"
 REWARD_WEIGHTS="${REWARD_WEIGHTS:-}"
 ANSWER_ACCURACY_WEIGHT="${ANSWER_ACCURACY_WEIGHT:-0.8}"
 ANSWER_FORMAT_WEIGHT="${ANSWER_FORMAT_WEIGHT:-0.2}"
-REASONING_TASK_TYPE="${REASONING_TASK_TYPE:-length}"
 GRPO_TRAIN_VIDEO_ONLY="${GRPO_TRAIN_VIDEO_ONLY:-true}"
 GRPO_TRAIN_VIDEO_ONLY_LC="$(printf '%s' "${GRPO_TRAIN_VIDEO_ONLY}" | tr '[:upper:]' '[:lower:]')"
 
