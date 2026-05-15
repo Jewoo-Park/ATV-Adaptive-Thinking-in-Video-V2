@@ -107,13 +107,22 @@ def test_parsed_tag_to_strategy():
 class _StubTrainer:
     """Lightweight test fixture matching the trainer's strategy-related config surface."""
 
-    def __init__(self, task_type: str, alpha: float, threshold: float, G: int = 9, k: int = 3):
+    def __init__(
+        self,
+        task_type: str,
+        alpha: float,
+        threshold: float,
+        tie_break_bonus_scale: float = 0.0,
+        G: int = 9,
+        k: int = 3,
+    ):
         self.reasoning_task_type = task_type
         self.balanced_strategy_rollout = True
         self.num_generations = G
         self.rollouts_per_strategy = k
         self.strategy_bonus_scale = alpha
         self.strategy_bonus_threshold = threshold
+        self.tie_break_bonus_scale = tie_break_bonus_scale
         self._strategies = strategies_for_task(task_type)
         plan = build_balanced_strategy_plan(task_type, G, k)
         self._strategy_plan_per_prompt = plan
@@ -126,6 +135,7 @@ class _StubTrainer:
             num_strategies=len(self._strategies),
             bonus_scale=self.strategy_bonus_scale,
             bonus_threshold=self.strategy_bonus_threshold,
+            tie_break_bonus_scale=self.tie_break_bonus_scale,
         )
 
 
@@ -162,15 +172,17 @@ def test_bonus_math_known_inputs():
 
 
 def test_bonus_math_margin_gate():
-    header("Test 5: margin < threshold suppresses bonus")
-    trainer = _StubTrainer("length", alpha=0.1, threshold=0.34)
+    header("Test 5: margin < threshold with tie_break=0 leaves reward unchanged")
+    # tie_break_bonus_scale=0.0 (default) => neutral, no change to rewards
+    trainer = _StubTrainer("length", alpha=0.1, threshold=0.34, tie_break_bonus_scale=0.0)
     # Strategy means: direct=0.5, cot=0.4, long_cot=0.4 -> margin = 0.1 < 0.34
     base = torch.tensor([0.5, 0.5, 0.5, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4])
     final, log = trainer._apply_strategy_bonus(base)
     print(f"  margin = {float(log['margin'].item()):.4f} (threshold=0.34)")
     print(f"  apply_mask = {float(log['apply_mask'].item())}")
-    check(torch.allclose(final, base), "final == base (bonus suppressed)")
+    check(torch.allclose(final, base), "final == base (tie_break=0 => no change)")
     check(log["apply_mask"].item() == 0.0, "apply_mask == 0.0 (gated off)")
+    check(log["tie_break_mask"].item() == 1.0, "tie_break_mask == 1.0")
 
 
 def test_bonus_math_two_groups():
@@ -235,8 +247,16 @@ def test_balanced_off_no_change():
 class _MetricsStub(_StubTrainer):
     """_StubTrainer + the metric-emitting wrappers, replicated from the trainer."""
 
-    def __init__(self, task_type: str, alpha: float, threshold: float, G: int = 9, k: int = 3):
-        super().__init__(task_type, alpha, threshold, G=G, k=k)
+    def __init__(
+        self,
+        task_type: str,
+        alpha: float,
+        threshold: float,
+        tie_break_bonus_scale: float = 0.0,
+        G: int = 9,
+        k: int = 3,
+    ):
+        super().__init__(task_type, alpha, threshold, tie_break_bonus_scale=tie_break_bonus_scale, G=G, k=k)
         from collections import defaultdict
         self._metrics = defaultdict(list)
         self.log_strategy_metrics = True
@@ -252,37 +272,64 @@ class _MetricsStub(_StubTrainer):
             self._metrics[f"strategy/{k}"].append(v)
 
     def _log_strategy_metrics(self, base_rewards, strategy_log):
+        import torch as _torch
         base = strategy_log["base"]
         final = strategy_log["final"]
         strategy_mean = strategy_log["strategy_mean"]
         margin = strategy_log["margin"]
         apply_mask = strategy_log["apply_mask"]
+        tie_break_mask = strategy_log["tie_break_mask"]
         best_idx = strategy_log["best_idx"]
+        effective_best_idx = strategy_log["effective_best_idx"]
+        B_total, S = strategy_mean.shape
+
         self._metrics["strategy/base_mean"].append(float(base.mean().item()))
         self._metrics["strategy/final_mean"].append(float(final.mean().item()))
         self._metrics["strategy/strategy_bonus_applied_rate"].append(
             float(apply_mask.mean().item())
         )
         self._metrics["strategy/strategy_margin_mean"].append(float(margin.mean().item()))
+
         per_strategy_mean = strategy_mean.mean(dim=0)
         for s_idx, s_name in enumerate(self._strategies):
             self._metrics[f"strategy/mean_reward_{s_name}"].append(
                 float(per_strategy_mean[s_idx].item())
             )
+
+        # reward_best_*_rate: highest raw reward, gated by margin threshold.
         self._log_strategy_distribution(
-            key_prefix="best_strategy",
+            key_prefix="reward_best",
             chosen_idx=best_idx,
             clear_mask=apply_mask,
         )
 
+        self._metrics["strategy/reward_tie_or_unclear_rate"].append(
+            float(tie_break_mask.mean().item())
+        )
+        self._metrics["strategy/tie_break_applied_rate"].append(
+            float(tie_break_mask.mean().item())
+        )
+
+        for s_idx, s_name in enumerate(self._strategies):
+            rate = float(tie_break_mask.mean().item()) if s_idx == 0 else 0.0
+            self._metrics[f"strategy/tie_break_to_{s_name}_rate"].append(rate)
+
+        ones = _torch.ones(B_total, device=apply_mask.device, dtype=apply_mask.dtype)
+        self._log_strategy_distribution(
+            key_prefix="effective_best",
+            chosen_idx=effective_best_idx,
+            clear_mask=ones,
+        )
+
 
 def test_best_strategy_metric_keys_length():
-    header("Test 9a: LENGTH best_strategy metric keys are emitted with gating")
-    trainer = _MetricsStub("length", alpha=0.1, threshold=0.34)
+    header("Test 9a: LENGTH reward_best/effective_best metric keys are emitted")
+    # tie_break_bonus_scale=0.0 so final==base on tie groups; effective_best logic still tracked.
+    trainer = _MetricsStub("length", alpha=0.1, threshold=0.34, tie_break_bonus_scale=0.0)
     # Three groups:
     #   group 0: direct=1.0, cot=0.0, long_cot=0.5  -> margin 0.5  best=direct
     #   group 1: direct=0.0, cot=0.9, long_cot=0.4  -> margin 0.5  best=cot
-    #   group 2: direct=0.5, cot=0.5, long_cot=0.5  -> margin 0.0  tie
+    #   group 2: direct=0.5, cot=0.5, long_cot=0.5  -> margin 0.0  tie -> effective_best=direct(0)
     base = torch.tensor([
         1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.5, 0.5, 0.5,
         0.0, 0.0, 0.0, 0.9, 0.9, 0.9, 0.4, 0.4, 0.4,
@@ -300,21 +347,35 @@ def test_best_strategy_metric_keys_length():
         "strategy/mean_reward_direct",
         "strategy/mean_reward_cot",
         "strategy/mean_reward_long_cot",
-        "strategy/best_strategy_direct_rate",
-        "strategy/best_strategy_cot_rate",
-        "strategy/best_strategy_long_cot_rate",
-        "strategy/best_strategy_tie_or_unclear_rate",
+        "strategy/reward_best_direct_rate",
+        "strategy/reward_best_cot_rate",
+        "strategy/reward_best_long_cot_rate",
+        "strategy/reward_best_tie_or_unclear_rate",
+        "strategy/reward_tie_or_unclear_rate",
+        "strategy/tie_break_applied_rate",
+        "strategy/tie_break_to_direct_rate",
+        "strategy/tie_break_to_cot_rate",
+        "strategy/tie_break_to_long_cot_rate",
+        "strategy/effective_best_direct_rate",
+        "strategy/effective_best_cot_rate",
+        "strategy/effective_best_long_cot_rate",
+        "strategy/effective_best_tie_or_unclear_rate",
     }
     missing = expected_keys - set(metrics.keys())
     check(not missing, f"all required LENGTH keys present (missing={missing})")
-    # 1 of 3 groups -> direct clear best, 1 of 3 -> cot clear best, 1 of 3 -> tie.
-    check(abs(metrics["strategy/best_strategy_direct_rate"] - 1 / 3) < 1e-6, "direct rate = 1/3")
-    check(abs(metrics["strategy/best_strategy_cot_rate"] - 1 / 3) < 1e-6, "cot rate = 1/3")
-    check(abs(metrics["strategy/best_strategy_long_cot_rate"] - 0.0) < 1e-6, "long_cot rate = 0")
-    check(
-        abs(metrics["strategy/best_strategy_tie_or_unclear_rate"] - 1 / 3) < 1e-6,
-        "tie_or_unclear rate = 1/3",
-    )
+    # 1/3 groups -> direct clear best, 1/3 -> cot clear best, 1/3 -> tie.
+    check(abs(metrics["strategy/reward_best_direct_rate"] - 1 / 3) < 1e-6, "reward_best_direct_rate = 1/3")
+    check(abs(metrics["strategy/reward_best_cot_rate"] - 1 / 3) < 1e-6, "reward_best_cot_rate = 1/3")
+    check(abs(metrics["strategy/reward_best_long_cot_rate"] - 0.0) < 1e-6, "reward_best_long_cot_rate = 0")
+    check(abs(metrics["strategy/reward_best_tie_or_unclear_rate"] - 1 / 3) < 1e-6, "reward_best tie_or_unclear = 1/3")
+    check(abs(metrics["strategy/tie_break_applied_rate"] - 1 / 3) < 1e-6, "tie_break_applied_rate = 1/3")
+    check(abs(metrics["strategy/tie_break_to_direct_rate"] - 1 / 3) < 1e-6, "tie_break_to_direct = 1/3")
+    check(abs(metrics["strategy/tie_break_to_cot_rate"] - 0.0) < 1e-6, "tie_break_to_cot = 0")
+    # effective_best: group0=direct, group1=cot, group2=direct(tie-break) -> direct=2/3, cot=1/3
+    check(abs(metrics["strategy/effective_best_direct_rate"] - 2 / 3) < 1e-6, "effective_best_direct = 2/3")
+    check(abs(metrics["strategy/effective_best_cot_rate"] - 1 / 3) < 1e-6, "effective_best_cot = 1/3")
+    check(abs(metrics["strategy/effective_best_long_cot_rate"] - 0.0) < 1e-6, "effective_best_long_cot = 0")
+    check(abs(metrics["strategy/effective_best_tie_or_unclear_rate"] - 0.0) < 1e-6, "effective_best no tie (clear_mask=ones)")
     check(
         abs(metrics["strategy/strategy_bonus_applied_rate"] - 2 / 3) < 1e-6,
         "bonus_applied_rate = 2/3 (two clear groups out of three)",
@@ -322,10 +383,10 @@ def test_best_strategy_metric_keys_length():
 
 
 def test_best_strategy_metric_keys_perspective():
-    header("Test 9b: PERSPECTIVE best_strategy metric keys are emitted with gating")
-    trainer = _MetricsStub("perspective", alpha=0.1, threshold=0.34)
+    header("Test 9b: PERSPECTIVE reward_best/effective_best metric keys are emitted")
+    trainer = _MetricsStub("perspective", alpha=0.1, threshold=0.34, tie_break_bonus_scale=0.0)
     # group 0: abstract=0.2, temporal=0.9, spatiotemporal=0.4 -> best=temporal (margin 0.5)
-    # group 1: 0.3, 0.3, 0.3 -> tie
+    # group 1: 0.3, 0.3, 0.3 -> tie -> effective_best=abstract(0)
     base = torch.tensor([
         0.2, 0.2, 0.2, 0.9, 0.9, 0.9, 0.4, 0.4, 0.4,
         0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3,
@@ -334,20 +395,27 @@ def test_best_strategy_metric_keys_perspective():
     trainer._log_strategy_metrics(base, log)
     metrics = {k: v[-1] for k, v in trainer._metrics.items()}
     expected_keys = {
-        "strategy/best_strategy_abstract_rate",
-        "strategy/best_strategy_temporal_rate",
-        "strategy/best_strategy_spatiotemporal_rate",
-        "strategy/best_strategy_tie_or_unclear_rate",
+        "strategy/reward_best_abstract_rate",
+        "strategy/reward_best_temporal_rate",
+        "strategy/reward_best_spatiotemporal_rate",
+        "strategy/reward_best_tie_or_unclear_rate",
+        "strategy/effective_best_abstract_rate",
+        "strategy/effective_best_temporal_rate",
+        "strategy/effective_best_spatiotemporal_rate",
         "strategy/mean_reward_abstract",
         "strategy/mean_reward_temporal",
         "strategy/mean_reward_spatiotemporal",
+        "strategy/tie_break_applied_rate",
     }
     missing = expected_keys - set(metrics.keys())
     check(not missing, f"all required PERSPECTIVE keys present (missing={missing})")
-    check(abs(metrics["strategy/best_strategy_temporal_rate"] - 0.5) < 1e-6, "temporal rate = 1/2")
-    check(abs(metrics["strategy/best_strategy_abstract_rate"] - 0.0) < 1e-6, "abstract rate = 0")
-    check(abs(metrics["strategy/best_strategy_spatiotemporal_rate"] - 0.0) < 1e-6, "spatiotemporal rate = 0")
-    check(abs(metrics["strategy/best_strategy_tie_or_unclear_rate"] - 0.5) < 1e-6, "tie_or_unclear = 1/2")
+    check(abs(metrics["strategy/reward_best_temporal_rate"] - 0.5) < 1e-6, "reward_best_temporal = 1/2")
+    check(abs(metrics["strategy/reward_best_abstract_rate"] - 0.0) < 1e-6, "reward_best_abstract = 0")
+    check(abs(metrics["strategy/reward_best_tie_or_unclear_rate"] - 0.5) < 1e-6, "reward_best tie_or_unclear = 1/2")
+    # effective_best: group0=temporal(1), group1=abstract(0, tie-break) -> abstract=1/2, temporal=1/2
+    check(abs(metrics["strategy/effective_best_temporal_rate"] - 0.5) < 1e-6, "effective_best_temporal = 1/2")
+    check(abs(metrics["strategy/effective_best_abstract_rate"] - 0.5) < 1e-6, "effective_best_abstract = 1/2 (tie-break)")
+    check(abs(metrics["strategy/effective_best_spatiotemporal_rate"] - 0.0) < 1e-6, "effective_best_spatiotemporal = 0")
 
 
 def test_selected_strategy_extensibility():
@@ -371,6 +439,47 @@ def test_selected_strategy_extensibility():
         abs(metrics["strategy/selected_strategy_tie_or_unclear_rate"] - 0.0) < 1e-6,
         "tie_or_unclear = 0 when clear_mask is all-ones",
     )
+
+
+def test_tie_break_bonus_applied():
+    header("Test 5b: margin < threshold with tie_break_bonus_scale=0.05 nudges index-0")
+    # S=3, tie_break=0.05 => index-0 gets +0.05, others get -0.025 each (zero-sum)
+    trainer = _StubTrainer("length", alpha=0.1, threshold=0.34, tie_break_bonus_scale=0.05)
+    # Strategy means all equal -> margin=0 -> tie-break path
+    base = torch.tensor([0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5])
+    final, log = trainer._apply_strategy_bonus(base)
+    print(f"  apply_mask = {float(log['apply_mask'].item())}, tie_break_mask = {float(log['tie_break_mask'].item())}")
+    print(f"  bonus_per_strategy = {log['bonus_per_strategy'][0].tolist()}")
+    check(log["apply_mask"].item() == 0.0, "apply_mask == 0.0 (full bonus not triggered)")
+    check(log["tie_break_mask"].item() == 1.0, "tie_break_mask == 1.0")
+    b = log["bonus_per_strategy"][0]  # (S,) = [0.05, -0.025, -0.025]
+    check(abs(float(b[0].item()) - 0.05) < 1e-6, "index-0 bonus == +0.05")
+    check(abs(float(b[1].item()) - (-0.025)) < 1e-6, "index-1 bonus == -0.025")
+    check(abs(float(b[2].item()) - (-0.025)) < 1e-6, "index-2 bonus == -0.025")
+    check(abs(float(b.sum().item())) < 1e-6, "tie-break bonus is zero-sum")
+    # direct slots get +0.05, others get -0.025
+    expected_direct = 0.5 + 0.05
+    expected_other = 0.5 - 0.025
+    check(abs(float(final[0].item()) - expected_direct) < 1e-6, f"direct slot final == {expected_direct}")
+    check(abs(float(final[3].item()) - expected_other) < 1e-6, f"cot slot final == {expected_other}")
+    check(log["effective_best_idx"].item() == 0, "effective_best_idx == 0 (tie-break selects simplest)")
+
+
+def test_tie_break_not_applied_when_clear():
+    header("Test 5c: margin >= threshold => full bonus, NOT tie-break")
+    trainer = _StubTrainer("length", alpha=0.1, threshold=0.34, tie_break_bonus_scale=0.05)
+    # Clear winner: direct=1.0, others=0.0 -> margin=1.0 >= 0.34 -> full bonus
+    base = torch.tensor([1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    final, log = trainer._apply_strategy_bonus(base)
+    check(log["apply_mask"].item() == 1.0, "apply_mask == 1.0 (full bonus)")
+    check(log["tie_break_mask"].item() == 0.0, "tie_break_mask == 0.0 (tie-break not applied)")
+    check(log["effective_best_idx"].item() == 0, "effective_best_idx == 0 (best = direct)")
+    # Full bonus: overall=(1+0+0)/3=1/3, bonus_direct=1-1/3=2/3, bonus_other=0-1/3=-1/3
+    overall = 1.0 / 3.0
+    exp_direct = 1.0 + 0.1 * (1.0 - overall)
+    exp_other = 0.0 + 0.1 * (0.0 - overall)
+    check(abs(float(final[0].item()) - exp_direct) < 1e-6, f"direct final == {exp_direct:.4f}")
+    check(abs(float(final[3].item()) - exp_other) < 1e-6, f"cot final == {exp_other:.4f}")
 
 
 def test_grpo_group_grouping_logic():
@@ -399,6 +508,8 @@ def main():
     test_parsed_tag_to_strategy()
     test_bonus_math_known_inputs()
     test_bonus_math_margin_gate()
+    test_tie_break_bonus_applied()
+    test_tie_break_not_applied_when_clear()
     test_bonus_math_two_groups()
     test_bonus_zero_mean_within_group()
     test_balanced_off_no_change()

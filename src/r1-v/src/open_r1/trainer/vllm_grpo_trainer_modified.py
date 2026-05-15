@@ -570,6 +570,7 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
         rollouts_per_strategy: int = 3,
         strategy_bonus_scale: float = 0.1,
         strategy_bonus_threshold: float = 0.34,
+        tie_break_bonus_scale: float = 0.05,
         log_strategy_metrics: bool = True,
         strategy_debug_log_path: str = "",
     ):
@@ -827,6 +828,7 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
         self.rollouts_per_strategy = int(rollouts_per_strategy)
         self.strategy_bonus_scale = float(strategy_bonus_scale)
         self.strategy_bonus_threshold = float(strategy_bonus_threshold)
+        self.tie_break_bonus_scale = float(tie_break_bonus_scale)
         self.log_strategy_metrics = bool(log_strategy_metrics)
         self.strategy_debug_log_path = str(strategy_debug_log_path or "").strip()
         self._strategies = strategies_for_task(self.reasoning_task_type)
@@ -1352,6 +1354,7 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
             num_strategies=len(self._strategies),
             bonus_scale=self.strategy_bonus_scale,
             bonus_threshold=self.strategy_bonus_threshold,
+            tie_break_bonus_scale=self.tie_break_bonus_scale,
         )
 
     def _log_strategy_distribution(
@@ -1380,7 +1383,9 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
         strategy_mean = strategy_log["strategy_mean"]  # (B_total, S)
         margin = strategy_log["margin"]
         apply_mask = strategy_log["apply_mask"]
+        tie_break_mask = strategy_log["tie_break_mask"]
         best_idx = strategy_log["best_idx"]
+        effective_best_idx = strategy_log["effective_best_idx"]
         B_total, S = strategy_mean.shape
 
         # Headline aggregates.
@@ -1398,13 +1403,42 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                 float(per_strategy_mean[s_idx].item())
             )
 
-        # Best-strategy distribution, gated by margin threshold:
-        #   only count the argmax as the "best" when (best - second_best) >= threshold;
-        #   otherwise the group is tie_or_unclear.
+        # reward_best_*_rate: per strategy, fraction of groups where it had highest raw reward
+        # (gated by margin threshold — tie_or_unclear when margin is below threshold).
         self._log_strategy_distribution(
-            key_prefix="best_strategy",
+            key_prefix="reward_best",
             chosen_idx=best_idx,
             clear_mask=apply_mask,
+        )
+
+        # reward_tie_or_unclear_rate: fraction of groups where margin < threshold (= tie-break zone).
+        self._metrics["strategy/reward_tie_or_unclear_rate"].append(
+            float(tie_break_mask.mean().item())
+        )
+
+        # tie_break_applied_rate: fraction of groups where tie-break bonus was actually applied
+        # (same as reward_tie_or_unclear_rate, but named explicitly for clarity in dashboards).
+        self._metrics["strategy/tie_break_applied_rate"].append(
+            float(tie_break_mask.mean().item())
+        )
+
+        # tie_break_to_*_rate: per strategy, fraction of ALL groups where tie-break selected it.
+        # Tie-break always selects index 0; others get 0. Useful to confirm index-0 = direct/abstract.
+        for s_idx, s_name in enumerate(self._strategies):
+            if s_idx == 0:
+                rate = float(tie_break_mask.mean().item())
+            else:
+                rate = 0.0
+            self._metrics[f"strategy/tie_break_to_{s_name}_rate"].append(rate)
+
+        # effective_best_*_rate: fraction of groups where each strategy is the effective best
+        # (actual argmax when margin >= threshold, simplest index 0 when tie-break).
+        # No gate: every group has an effective best, so clear_mask = ones.
+        ones = torch.ones(B_total, device=apply_mask.device, dtype=apply_mask.dtype)
+        self._log_strategy_distribution(
+            key_prefix="effective_best",
+            chosen_idx=effective_best_idx,
+            clear_mask=ones,
         )
 
     def _write_strategy_debug_jsonl(

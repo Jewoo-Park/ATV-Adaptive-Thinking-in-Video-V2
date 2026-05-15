@@ -5,7 +5,6 @@ GRPO는 `Video-R1` 계열 데이터를 공통 JSONL 포맷으로 두고, `open_r
 
 GRPO 단계는 옵션으로 **balanced strategy rollout**을 지원합니다. 한 prompt의 `num_generations`개 rollout을 strategy별(LENGTH: direct / cot / long_cot, PERSPECTIVE: abstract / temporal / spatiotemporal)로 균등 분배하고, 같은 prompt group 안에서 strategy 평균 reward를 비교해 final reward를 만들어 GRPO advantage에 넣습니다. 자세한 내용은 §5-8 참조.
 
-YAML·스크립트 파일명에 남아 있는 `3b` 표기는 과거 명명이며, **실제 기본 설정은 7B 모델**입니다.
 
 ---
 

@@ -116,6 +116,7 @@ def compute_strategy_bonus(
     num_strategies: int,
     bonus_scale: float,
     bonus_threshold: float,
+    tie_break_bonus_scale: float = 0.0,
 ) -> tuple[torch.Tensor, dict]:
     """Strategy-relative reward shaping (pure-function form, callable without the trainer).
 
@@ -123,15 +124,19 @@ def compute_strategy_bonus(
         base_rewards: 1D tensor of length B_total * G, in prompt-major slot order.
         strategy_index_per_slot: Length-G list giving the strategy index for each slot.
         num_strategies: S.
-        bonus_scale: alpha for `final = base + alpha * (strategy_mean - mean(strategy_means))`.
+        bonus_scale: alpha for `final = base + alpha * (strategy_mean - mean(strategy_means))`
+            when margin >= bonus_threshold.
         bonus_threshold: if (best_strategy_mean - second_best_strategy_mean) < threshold,
-            the bonus is suppressed for that prompt group.
+            apply tie-break instead of full bonus.
+        tie_break_bonus_scale: when margin < bonus_threshold, apply a small zero-sum bonus
+            nudging strategy index 0 (simplest: direct/abstract) upward.
+            Set to 0.0 (default) to suppress tie-break (neutral / legacy behavior).
 
     Returns:
         (final_rewards 1D, log_dict). log_dict contains tensors with prompt-group rows:
         base (B_total, G), final (B_total, G), strategy_mean (B_total, S),
         bonus_per_strategy (B_total, S), margin (B_total,), apply_mask (B_total,),
-        best_idx (B_total,).
+        tie_break_mask (B_total,), best_idx (B_total,), effective_best_idx (B_total,).
     """
     device = base_rewards.device
     dtype = base_rewards.dtype
@@ -158,21 +163,40 @@ def compute_strategy_bonus(
     strategy_cnt.scatter_add_(1, strat_idx_grouped, torch.ones_like(base))
     strategy_mean = strategy_sum / strategy_cnt.clamp(min=1.0)  # (B_total, S)
 
-    overall = strategy_mean.mean(dim=1, keepdim=True)
-    bonus_per_strategy = strategy_mean - overall  # zero-sum across S per row
-
     sorted_means, _ = strategy_mean.sort(dim=1, descending=True)
     if S >= 2:
         margin = sorted_means[:, 0] - sorted_means[:, 1]
     else:
         margin = torch.zeros(B_total, device=device, dtype=dtype)
-    apply_mask = (margin >= float(bonus_threshold)).to(dtype)
-    bonus_per_strategy = bonus_per_strategy * apply_mask.unsqueeze(1)
+
+    apply_mask = (margin >= float(bonus_threshold)).to(dtype)  # 1 = full bonus, 0 = tie-break
+    tie_break_mask = 1.0 - apply_mask                         # 1 = tie-break applies
+
+    # Full relative bonus (zero-sum across S per row).
+    overall = strategy_mean.mean(dim=1, keepdim=True)
+    relative_bonus = strategy_mean - overall  # (B_total, S)
+
+    # Tie-break bonus: +tie_break_bonus_scale to index-0 (simplest), evenly distributed to rest.
+    # Zero-sum across strategies per row.
+    if S > 1:
+        tb_val = float(tie_break_bonus_scale)
+        tb_bonus = torch.full((B_total, S), fill_value=-tb_val / (S - 1), device=device, dtype=dtype)
+        tb_bonus[:, 0] = tb_val
+    else:
+        tb_bonus = torch.zeros(B_total, S, device=device, dtype=dtype)
+
+    # Combine: full relative bonus where margin is clear, tie-break where it is not.
+    bonus_per_strategy = (
+        float(bonus_scale) * relative_bonus * apply_mask.unsqueeze(1)
+        + tb_bonus * tie_break_mask.unsqueeze(1)
+    )
 
     bonus_per_slot = bonus_per_strategy.gather(1, strat_idx_grouped)
-    final = base + float(bonus_scale) * bonus_per_slot
+    final = base + bonus_per_slot
 
     best_idx = strategy_mean.argmax(dim=1)
+    # Effective best: actual argmax when margin is clear, simplest (index 0) on tie-break.
+    effective_best_idx = torch.where(apply_mask.bool(), best_idx, torch.zeros_like(best_idx))
 
     log_dict = {
         "base": base,
@@ -181,7 +205,9 @@ def compute_strategy_bonus(
         "bonus_per_strategy": bonus_per_strategy,
         "margin": margin,
         "apply_mask": apply_mask,
+        "tie_break_mask": tie_break_mask,
         "best_idx": best_idx,
+        "effective_best_idx": effective_best_idx,
     }
     return final.reshape(-1), log_dict
 

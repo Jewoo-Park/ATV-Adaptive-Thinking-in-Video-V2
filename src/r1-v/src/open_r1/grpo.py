@@ -69,7 +69,15 @@ class GRPOVideoScriptArguments(ScriptArguments):
         default=0.34,
         metadata={
             "help": "If (best_strategy_mean - second_best_strategy_mean) < threshold for a prompt group, "
-            "skip the bonus for that group and use base reward as final reward."
+            "apply tie-break bonus instead of the full relative strategy bonus."
+        },
+    )
+    tie_break_bonus_scale: float = field(
+        default=0.05,
+        metadata={
+            "help": "Bonus scale applied toward the simplest strategy (direct/abstract, index 0) "
+            "when margin < strategy_bonus_threshold. Should be weaker than strategy_bonus_scale. "
+            "Set to 0.0 to disable (neutral / no tie-break)."
         },
     )
     log_strategy_metrics: bool = field(
@@ -367,6 +375,7 @@ def main(script_args, training_args, model_args):
             rollouts_per_strategy=script_args.rollouts_per_strategy,
             strategy_bonus_scale=script_args.strategy_bonus_scale,
             strategy_bonus_threshold=script_args.strategy_bonus_threshold,
+            tie_break_bonus_scale=script_args.tie_break_bonus_scale,
             log_strategy_metrics=script_args.log_strategy_metrics,
             strategy_debug_log_path=script_args.strategy_debug_log_path,
         )
