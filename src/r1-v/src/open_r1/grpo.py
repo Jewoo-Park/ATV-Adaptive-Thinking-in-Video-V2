@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
@@ -62,22 +63,20 @@ class GRPOVideoScriptArguments(ScriptArguments):
         metadata={"help": "Rollouts per strategy when balanced_strategy_rollout=true. num_generations must equal 3 * this."},
     )
     strategy_bonus_scale: float = field(
-        default=0.1,
+        default=0.2,
         metadata={"help": "Alpha multiplier for strategy bonus: final = base + alpha * (strategy_mean - mean(strategy_means))."},
     )
     strategy_bonus_threshold: float = field(
-        default=0.34,
+        default=0.10,
         metadata={
             "help": "If (best_strategy_mean - second_best_strategy_mean) < threshold for a prompt group, "
-            "apply tie-break bonus instead of the full relative strategy bonus."
+            "apply no strategy bonus and leave effective_best_strategy unset."
         },
     )
     tie_break_bonus_scale: float = field(
-        default=0.05,
+        default=0.0,
         metadata={
-            "help": "Bonus scale applied toward the simplest strategy (direct/abstract, index 0) "
-            "when margin < strategy_bonus_threshold. Should be weaker than strategy_bonus_scale. "
-            "Set to 0.0 to disable (neutral / no tie-break)."
+            "help": "Deprecated compatibility argument. Tie/unclear prompt groups now receive no strategy bonus."
         },
     )
     log_strategy_metrics: bool = field(
@@ -91,6 +90,26 @@ class GRPOVideoScriptArguments(ScriptArguments):
             "(forced strategy, parsed tag, base/final reward, advantage) at each step."
         },
     )
+    strategy_eval_every_steps: int = field(
+        default=0,
+        metadata={
+            "help": "If >0, run periodic eval during training every N optimizer steps and log per-strategy accuracies."
+        },
+    )
+    strategy_eval_max_samples: int = field(
+        default=60,
+        metadata={
+            "help": "Maximum number of eval samples used per periodic strategy eval pass."
+        },
+    )
+    strategy_eval_batch_size: int = field(
+        default=8,
+        metadata={"help": "Batch size for periodic strategy eval generation."},
+    )
+    log_strategy_eval_metrics: bool = field(
+        default=True,
+        metadata={"help": "Enable periodic strategy eval metric logging when strategy_eval_every_steps > 0."},
+    )
 
 
 GRPOScriptArguments = GRPOVideoScriptArguments
@@ -98,6 +117,21 @@ GRPOScriptArguments = GRPOVideoScriptArguments
 
 def _reward_task_type() -> str:
     return os.getenv("GRPO_REASONING_TASK_TYPE", "length").strip().lower() or "length"
+
+
+def _allowed_option_letters(problem: str) -> set[str]:
+    letters = {
+        m.group(1).upper()
+        for m in re.finditer(r"(?:^|\n)\s*([A-J])\s*[\.\)]", str(problem or ""))
+    }
+    return letters or set("ABCDEFGHIJ")
+
+
+def _strategy_matches_forced(parsed, forced_strategy: Optional[str]) -> bool:
+    forced = str(forced_strategy or "").strip().lower()
+    if not forced:
+        return True
+    return parsed.parsed_strategy == forced
 
 
 # Train JSONL mixes video clips (.mp4, …) with image-only QA rows (video_id ending in .png/.jpg, …).
@@ -111,16 +145,25 @@ def _train_row_is_video_clip(example: dict) -> bool:
     return not any(vid.endswith(sfx) for sfx in _STATIC_IMAGE_SUFFIXES)
 
 
-def answer_accuracy_reward(completions, solution, **kwargs):
+def answer_accuracy_reward(completions, solution, forced_strategy=None, problem=None, **kwargs):
     completion_contents = [completion[0]["content"] for completion in completions]
+    forced_strategy = forced_strategy or [None] * len(completion_contents)
+    problem = problem or [""] * len(completion_contents)
     rewards = []
     current_time = datetime.now().strftime("%d-%H-%M-%S-%f")
-    for content, sol in zip(completion_contents, solution):
+    for content, sol, forced, prob in zip(completion_contents, solution, forced_strategy, problem):
         parsed = parse_strict_output(content, task_type=_reward_task_type())
         gt = normalize_gt_letter(sol)
+        option_ok = parsed.pred_letter in _allowed_option_letters(prob) if parsed.pred_letter else False
+        strategy_match = _strategy_matches_forced(parsed, forced)
         reward = (
             1.0
-            if parsed.format_ok and parsed.pred_letter is not None and gt is not None and parsed.pred_letter == gt
+            if parsed.format_ok
+            and strategy_match
+            and option_ok
+            and parsed.pred_letter is not None
+            and gt is not None
+            and parsed.pred_letter == gt
             else 0.0
         )
         rewards.append(reward)
@@ -129,18 +172,22 @@ def answer_accuracy_reward(completions, solution, **kwargs):
             os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(f"------------- {current_time} Accuracy reward: {reward} -------------\n")
+                f.write(f"Forced strategy: {forced}\n")
+                f.write(f"Parsed strategy: {parsed.parsed_strategy}\n")
                 f.write(f"Content: {content}\n")
                 f.write(f"Solution: {sol}\n")
     return rewards
 
 
-def _format_ok(content: str) -> int:
-    return int(parse_strict_output(content, task_type=_reward_task_type()).format_ok)
+def _format_ok(content: str, forced_strategy: Optional[str] = None) -> int:
+    parsed = parse_strict_output(content, task_type=_reward_task_type())
+    return int(parsed.format_ok and _strategy_matches_forced(parsed, forced_strategy))
 
 
-def answer_format_reward(completions, **kwargs):
+def answer_format_reward(completions, forced_strategy=None, **kwargs):
     completion_contents = [completion[0]["content"] for completion in completions]
-    return [1.0 if _format_ok(x) else 0.0 for x in completion_contents]
+    forced_strategy = forced_strategy or [None] * len(completion_contents)
+    return [1.0 if _format_ok(x, forced) else 0.0 for x, forced in zip(completion_contents, forced_strategy)]
 
 
 def write_test_predictions_jsonl(examples_completions: list[tuple[dict, str]], output_path: str) -> None:
@@ -174,23 +221,38 @@ reward_funcs_registry = {
 }
 
 
-LENGTH_SYSTEM_PROMPT = """You are a video multiple-choice question answering assistant.
+LENGTH_SYSTEM_PROMPT = """You are a video multiple-choice question answering assistant. You have learned to choose the best reasoning length for each question.
 
 Choose the appropriate reasoning length.
 
+Reasoning length selection rule:
+Use the shortest reasoning length that is sufficient to answer correctly.
+Choose Direct only when the answer is immediately clear from the video.
+Choose CoT when you need to compare options or connect a few visual clues.
+Choose Long CoT when the answer depends on multiple events, temporal order, object tracking, or combining several visual cues.
+
 Allowed outputs are exactly one of:
 
+Direct:
+Use when the answer is visually or textually obvious and does not require intermediate reasoning.
+<DIRECT>None</DIRECT>
 <ANSWER>X</ANSWER>
 
+Chain-of-Thought:
+Use when the problem requires moderate reasoning, option comparison, or a small number of evidence-grounded steps.
 <COT>...</COT>
 <ANSWER>X</ANSWER>
 
+Long Chain-of-Thought:
+Use when the problem requires multi-step reasoning, temporal ordering, event tracking, complex visual grounding, or integration of multiple cues.
 <LONG_COT>...</LONG_COT>
 <ANSWER>X</ANSWER>
 
+You must follow the format strictly.
 X must be a single option letter from A to J.
 Do NOT put explanations or option text inside <ANSWER>.
 Do NOT output anything outside the allowed tags.
+Do NOT output answer-only <ANSWER>X</ANSWER>.
 
 Example:
 User: [Video frames] Which option is correct?
@@ -198,29 +260,44 @@ Options:
 A. Red
 B. Blue
 C. Green
-Assistant: <ANSWER>B</ANSWER>
+Assistant: <DIRECT>None</DIRECT>
+<ANSWER>B</ANSWER>
 
 Now answer the question based on the video frames."""
 
 
-PERSPECTIVE_SYSTEM_PROMPT = """You are a video multiple-choice question answering assistant.
+PERSPECTIVE_SYSTEM_PROMPT = """You are a video multiple-choice question answering assistant. You have learned to choose the best reasoning perspective for each question.
 
 Choose the appropriate reasoning perspective.
 
+Perspective selection rule:
+Choose the perspective based on the evidence needed to answer correctly.
+Choose Abstract when the answer depends on the overall scene, object identity, or high-level meaning.
+Choose Temporal when the answer depends on order, timing, sequence, or change over time.
+Choose Spatiotemporal when the answer depends on motion, interaction, object location, or spatial relations across frames.
+
 Allowed outputs are exactly one of:
 
+Abstract:
+Use for conceptual, object-level, scene-level, or high-level semantic reasoning.
 <ABSTRACT>...</ABSTRACT>
 <ANSWER>X</ANSWER>
 
+Temporal:
+Use for questions involving before/after relations, ordering, sequence, duration, or changes over time.
 <TEMPORAL>...</TEMPORAL>
 <ANSWER>X</ANSWER>
 
+Spatiotemporal:
+Use for questions involving motion, spatial relations over time, object movement, physical interactions, or evidence that requires both spatial and temporal grounding.
 <SPATIOTEMPORAL>...</SPATIOTEMPORAL>
 <ANSWER>X</ANSWER>
 
+You must follow the format strictly.
 X must be a single option letter from A to J.
 Do NOT put explanations or option text inside <ANSWER>.
 Do NOT output anything outside the allowed tags.
+Do NOT output answer-only <ANSWER>X</ANSWER>.
 
 Example:
 User: [Video frames] Which option is correct?
@@ -271,8 +348,8 @@ def main(script_args, training_args, model_args):
     # Default reward weights when the user does not specify any overrides.
     # We bias toward answer accuracy while still enforcing output format.
     default_weight_by_name = {
-        "answer_accuracy": 0.8,
-        "answer_format": 0.2,
+        "answer_accuracy": 0.65,
+        "answer_format": 0.35,
     }
     reward_weights = [
         float(default_weight_by_name.get(name, 1.0)) for name in script_args.reward_funcs
@@ -378,6 +455,10 @@ def main(script_args, training_args, model_args):
             tie_break_bonus_scale=script_args.tie_break_bonus_scale,
             log_strategy_metrics=script_args.log_strategy_metrics,
             strategy_debug_log_path=script_args.strategy_debug_log_path,
+            strategy_eval_every_steps=script_args.strategy_eval_every_steps,
+            strategy_eval_max_samples=script_args.strategy_eval_max_samples,
+            strategy_eval_batch_size=script_args.strategy_eval_batch_size,
+            log_strategy_eval_metrics=script_args.log_strategy_eval_metrics,
         )
     elif script_args.balanced_strategy_rollout:
         raise ValueError(

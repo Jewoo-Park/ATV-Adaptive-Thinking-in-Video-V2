@@ -11,7 +11,7 @@ ANSWER_TAG_CI_RE = re.compile(r"</?\s*answer\s*>", re.IGNORECASE)
 FINAL_ANSWER_PATTERN = re.compile(r"<ANSWER>\s*([A-J])\s*</ANSWER>\s*$", re.DOTALL)
 STRICT_GT_PATTERN = re.compile(r"^\s*<ANSWER>\s*([A-J])\s*</ANSWER>\s*$", re.DOTALL)
 
-LENGTH_REASONING_TAGS = ("COT", "LONG_COT")
+LENGTH_REASONING_TAGS = ("DIRECT", "COT", "LONG_COT")
 PERSPECTIVE_REASONING_TAGS = ("ABSTRACT", "TEMPORAL", "SPATIOTEMPORAL")
 
 
@@ -22,6 +22,7 @@ class StrictAnswerResult:
     reasoning_tag: Optional[str]
     reasoning_text: Optional[str]
     malformed_type: Optional[str]
+    parsed_strategy: str
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -61,6 +62,23 @@ def _allowed_reasoning_tags(task_type: str) -> tuple[str, ...]:
     raise ValueError("task_type must be one of: length, perspective")
 
 
+def _strategy_for_tag(task_type: str, tag: Optional[str]) -> str:
+    normalized = str(task_type or "length").strip().lower()
+    if normalized == "length":
+        return {
+            "DIRECT": "direct",
+            "COT": "cot",
+            "LONG_COT": "long_cot",
+        }.get(str(tag or ""), "invalid")
+    if normalized == "perspective":
+        return {
+            "ABSTRACT": "abstract",
+            "TEMPORAL": "temporal",
+            "SPATIOTEMPORAL": "spatiotemporal",
+        }.get(str(tag or ""), "invalid")
+    raise ValueError("task_type must be one of: length, perspective")
+
+
 def _classify_answer_malformed(text: str) -> Optional[str]:
     exact_blocks = list(ANSWER_BLOCK_RE.finditer(text))
     exact_tag_count = len(ANSWER_TAG_ANY_RE.findall(text))
@@ -85,6 +103,7 @@ def _classify_answer_malformed(text: str) -> Optional[str]:
 
 def parse_strict_output(text: str, task_type: str = "length") -> StrictAnswerResult:
     raw = str(text or "")
+    normalized_task_type = str(task_type or "length").strip().lower()
     malformed = _classify_answer_malformed(raw)
     final_match = FINAL_ANSWER_PATTERN.search(raw)
     pred_letter = final_match.group(1) if final_match else None
@@ -95,6 +114,7 @@ def parse_strict_output(text: str, task_type: str = "length") -> StrictAnswerRes
             reasoning_tag=None,
             reasoning_text=None,
             malformed_type=malformed,
+            parsed_strategy="invalid",
         )
     if pred_letter is None:
         return StrictAnswerResult(
@@ -103,16 +123,22 @@ def parse_strict_output(text: str, task_type: str = "length") -> StrictAnswerRes
             reasoning_tag=None,
             reasoning_text=None,
             malformed_type="invalid_structure",
+            parsed_strategy="invalid",
         )
 
     answer_only = re.fullmatch(r"\s*<ANSWER>\s*([A-J])\s*</ANSWER>\s*", raw, re.DOTALL)
     if answer_only:
         return StrictAnswerResult(
-            pred_letter=pred_letter,
-            format_ok=True,
+            pred_letter=None,
+            format_ok=False,
             reasoning_tag=None,
             reasoning_text=None,
-            malformed_type=None,
+            malformed_type=(
+                "missing_perspective_reasoning_tag"
+                if normalized_task_type == "perspective"
+                else "missing_length_reasoning_tag"
+            ),
+            parsed_strategy="invalid",
         )
 
     for tag in _allowed_reasoning_tags(task_type):
@@ -120,6 +146,8 @@ def parse_strict_output(text: str, task_type: str = "length") -> StrictAnswerRes
         match = re.fullmatch(pattern, raw, re.DOTALL)
         if match:
             reasoning_text = match.group(1).strip()
+            if tag == "DIRECT" and reasoning_text != "None":
+                break
             if not reasoning_text:
                 break
             return StrictAnswerResult(
@@ -128,6 +156,7 @@ def parse_strict_output(text: str, task_type: str = "length") -> StrictAnswerRes
                 reasoning_tag=tag,
                 reasoning_text=reasoning_text,
                 malformed_type=None,
+                parsed_strategy=_strategy_for_tag(task_type, tag),
             )
 
     return StrictAnswerResult(
@@ -136,4 +165,5 @@ def parse_strict_output(text: str, task_type: str = "length") -> StrictAnswerRes
         reasoning_tag=None,
         reasoning_text=None,
         malformed_type="invalid_structure",
+        parsed_strategy="invalid",
     )

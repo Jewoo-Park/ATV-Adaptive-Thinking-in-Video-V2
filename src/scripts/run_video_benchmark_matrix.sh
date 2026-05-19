@@ -8,10 +8,14 @@
 #   export MODEL_BASE=/scratch/users/ntu/n2500182/models/Qwen2.5-VL-7B-Instruct
 #   export MODEL_SFT_MERGED=/scratch/users/ntu/n2500182/models/qwen25vl7b_lora_merged_length
 #   export MODEL_SFT_GRPO_MERGED=/scratch/users/ntu/n2500182/models/video_r1_uvb_grpo_answer_only_lora_merged_ckpt1500
-#   bash src/scripts/run_video_benchmark_matrix.sh
+#   REASONING_TASK_TYPE=length bash src/scripts/run_video_benchmark_matrix.sh
+#
+# Perspective model evaluation (must set mode explicitly):
+#   REASONING_TASK_TYPE=perspective bash src/scripts/run_video_benchmark_matrix.sh
 #
 # Optional: PROCESSOR_PATH (default = MODEL_BASE), BENCH_DEVICE (default cuda:0),
-#           PYTHON_BIN, GPU_MEM_UTIL, FRAMES_PER_SAMPLE (default 16), BENCH_EVAL_EXTRA.
+#           PYTHON_BIN, GPU_MEM_UTIL (default 0.25, matches VLLM_GPU_UTIL in GRPO training),
+#           BENCH_TEMPERATURE (default 0.8), FRAMES_PER_SAMPLE (default 16), BENCH_EVAL_EXTRA.
 # Eval always uses the full test JSONL (no max-samples in this launcher).
 
 set -euo pipefail
@@ -88,7 +92,8 @@ MODEL_SFT_MERGED="${MODEL_SFT_MERGED:-/scratch/users/ntu/n2500182/models/qwen25v
 MODEL_SFT_GRPO_MERGED="${MODEL_SFT_GRPO_MERGED:-/scratch/users/ntu/n2500182/models/video_r1_uvb_grpo_answer_only_lora_merged_ckpt1500}"
 PROCESSOR_PATH="${PROCESSOR_PATH:-${MODEL_BASE}}"
 BENCH_DEVICE="${BENCH_DEVICE:-cuda:0}"
-GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.60}"
+GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.25}"
+BENCH_TEMPERATURE="${BENCH_TEMPERATURE:-0.8}"
 FRAMES_PER_SAMPLE="${FRAMES_PER_SAMPLE:-16}"
 SUMMARY_DIR="${SUMMARY_DIR:-${REPO_ROOT}/outputs/video_benchmark_runs/$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "${SUMMARY_DIR}"
@@ -97,6 +102,14 @@ UVB_JSONL="${UVB_JSONL:-${REPO_ROOT}/data/urban_video_bench/grpo/uvb_grpo_test_s
 VIDEOMMMU_JSONL="${VIDEOMMMU_JSONL:-${REPO_ROOT}/data/video_mmmu/grpo/videommmu_grpo_test_strict.jsonl}"
 MMVU_JSONL="${MMVU_JSONL:-${REPO_ROOT}/data/mmvu/grpo/mmvu_grpo_test_strict.jsonl}"
 REASONING_TASK_TYPE="${REASONING_TASK_TYPE:-length}"
+REASONING_TASK_TYPE="$(printf '%s' "${REASONING_TASK_TYPE}" | tr '[:upper:]' '[:lower:]')"
+case "${REASONING_TASK_TYPE}" in
+  length|perspective) ;;
+  *)
+    echo "[BENCH-MATRIX] ERROR: REASONING_TASK_TYPE must be length or perspective (got ${REASONING_TASK_TYPE})" >&2
+    exit 1
+    ;;
+esac
 
 PROC_ARGS=()
 if [[ -n "${PROCESSOR_PATH}" ]]; then
@@ -146,6 +159,7 @@ _run_eval() {
     "${PROC_ARGS[@]}" \
     --device "${BENCH_DEVICE}" \
     --gpu-memory-utilization "${GPU_MEM_UTIL}" \
+    --temperature "${BENCH_TEMPERATURE}" \
     --frames-per-sample "${FRAMES_PER_SAMPLE}" \
     --reasoning-task-type "${REASONING_TASK_TYPE}" \
     ${BENCH_EVAL_EXTRA:-} \
@@ -165,6 +179,8 @@ echo "[BENCH-MATRIX] MODEL_SFT_MERGED=${MODEL_SFT_MERGED}"
 echo "[BENCH-MATRIX] MODEL_SFT_GRPO_MERGED=${MODEL_SFT_GRPO_MERGED}"
 echo "[BENCH-MATRIX] PROCESSOR_PATH=${PROCESSOR_PATH}"
 echo "[BENCH-MATRIX] BENCH_DEVICE=${BENCH_DEVICE}"
+echo "[BENCH-MATRIX] GPU_MEM_UTIL=${GPU_MEM_UTIL}"
+echo "[BENCH-MATRIX] BENCH_TEMPERATURE=${BENCH_TEMPERATURE}"
 echo "[BENCH-MATRIX] FRAMES_PER_SAMPLE=${FRAMES_PER_SAMPLE}"
 echo "[BENCH-MATRIX] PYTHON_BIN=${PYTHON_BIN}"
 echo "[BENCH-MATRIX] REASONING_TASK_TYPE=${REASONING_TASK_TYPE}"

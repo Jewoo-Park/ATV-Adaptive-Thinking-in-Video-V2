@@ -28,8 +28,9 @@ def strategies_for_task(task_type: str) -> tuple[str, ...]:
 _LENGTH_DIRECTIVES = {
     "direct": (
         "FORCED STRATEGY FOR THIS ROLLOUT: Direct Answer.\n"
-        "You MUST output ONLY <ANSWER>X</ANSWER> on a single line with no reasoning, "
-        "no <COT> or <LONG_COT> tags, and no text outside the <ANSWER> tag."
+        "Use this only when the answer is visually or textually obvious and does not require intermediate reasoning. "
+        "You MUST output exactly <DIRECT>None</DIRECT>\\n<ANSWER>X</ANSWER>. "
+        "Do NOT use <COT>, <LONG_COT>, or any other tag, and do NOT output text outside these two tags."
     ),
     "cot": (
         "FORCED STRATEGY FOR THIS ROLLOUT: Chain-of-Thought.\n"
@@ -84,7 +85,7 @@ def parsed_tag_to_strategy(task_type: str, reasoning_tag: Optional[str]) -> Opti
     """Map a strict-parser reasoning_tag to a strategy id (used for sanity logs)."""
     normalized_task = str(task_type or "length").strip().lower()
     if normalized_task == "length":
-        if reasoning_tag is None:
+        if reasoning_tag == "DIRECT":
             return "direct"
         if reasoning_tag == "COT":
             return "cot"
@@ -117,6 +118,7 @@ def compute_strategy_bonus(
     bonus_scale: float,
     bonus_threshold: float,
     tie_break_bonus_scale: float = 0.0,
+    slot_eligible_mask: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict]:
     """Strategy-relative reward shaping (pure-function form, callable without the trainer).
 
@@ -128,15 +130,17 @@ def compute_strategy_bonus(
             when margin >= bonus_threshold.
         bonus_threshold: if (best_strategy_mean - second_best_strategy_mean) < threshold,
             apply tie-break instead of full bonus.
-        tie_break_bonus_scale: when margin < bonus_threshold, apply a small zero-sum bonus
-            nudging strategy index 0 (simplest: direct/abstract) upward.
-            Set to 0.0 (default) to suppress tie-break (neutral / legacy behavior).
+        tie_break_bonus_scale: retained for CLI compatibility. Tie/unclear prompt groups
+            now receive no strategy bonus and no effective best strategy.
+        slot_eligible_mask: optional 1D mask matching base_rewards. Ineligible slots
+            cannot receive strategy bonus; their final reward remains their base reward.
 
     Returns:
         (final_rewards 1D, log_dict). log_dict contains tensors with prompt-group rows:
         base (B_total, G), final (B_total, G), strategy_mean (B_total, S),
         bonus_per_strategy (B_total, S), margin (B_total,), apply_mask (B_total,),
         tie_break_mask (B_total,), best_idx (B_total,), effective_best_idx (B_total,).
+        effective_best_idx is -1 when the prompt group is tied/unclear.
     """
     device = base_rewards.device
     dtype = base_rewards.dtype
@@ -156,6 +160,10 @@ def compute_strategy_bonus(
     )
     strat_idx_grouped = strat_idx_per_slot.unsqueeze(0).expand(B_total, -1)  # (B_total, G)
     base = base_rewards.view(B_total, G)
+    if slot_eligible_mask is None:
+        eligible = torch.ones_like(base)
+    else:
+        eligible = slot_eligible_mask.to(device=device, dtype=dtype).view(B_total, G)
 
     strategy_sum = torch.zeros(B_total, S, device=device, dtype=dtype)
     strategy_cnt = torch.zeros(B_total, S, device=device, dtype=dtype)
@@ -176,33 +184,23 @@ def compute_strategy_bonus(
     overall = strategy_mean.mean(dim=1, keepdim=True)
     relative_bonus = strategy_mean - overall  # (B_total, S)
 
-    # Tie-break bonus: +tie_break_bonus_scale to index-0 (simplest), evenly distributed to rest.
-    # Zero-sum across strategies per row.
-    if S > 1:
-        tb_val = float(tie_break_bonus_scale)
-        tb_bonus = torch.full((B_total, S), fill_value=-tb_val / (S - 1), device=device, dtype=dtype)
-        tb_bonus[:, 0] = tb_val
-    else:
-        tb_bonus = torch.zeros(B_total, S, device=device, dtype=dtype)
+    # Full relative bonus only when the margin is clear. Tied/unclear groups get no
+    # strategy bonus and no default direct/abstract bias.
+    bonus_per_strategy = float(bonus_scale) * relative_bonus * apply_mask.unsqueeze(1)
 
-    # Combine: full relative bonus where margin is clear, tie-break where it is not.
-    bonus_per_strategy = (
-        float(bonus_scale) * relative_bonus * apply_mask.unsqueeze(1)
-        + tb_bonus * tie_break_mask.unsqueeze(1)
-    )
-
-    bonus_per_slot = bonus_per_strategy.gather(1, strat_idx_grouped)
+    bonus_per_slot = bonus_per_strategy.gather(1, strat_idx_grouped) * eligible
     final = base + bonus_per_slot
 
     best_idx = strategy_mean.argmax(dim=1)
-    # Effective best: actual argmax when margin is clear, simplest (index 0) on tie-break.
-    effective_best_idx = torch.where(apply_mask.bool(), best_idx, torch.zeros_like(best_idx))
+    # Effective best exists only when the margin is clear.
+    effective_best_idx = torch.where(apply_mask.bool(), best_idx, torch.full_like(best_idx, -1))
 
     log_dict = {
         "base": base,
         "final": final,
         "strategy_mean": strategy_mean,
         "bonus_per_strategy": bonus_per_strategy,
+        "slot_eligible_mask": eligible,
         "margin": margin,
         "apply_mask": apply_mask,
         "tie_break_mask": tie_break_mask,

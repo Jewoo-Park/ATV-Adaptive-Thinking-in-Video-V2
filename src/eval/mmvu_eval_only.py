@@ -49,23 +49,38 @@ def text_stats(text: str, tokenizer) -> dict:
     return {"chars": len(text), "words": len(words), "tokens": len(token_ids)}
 
 
-LENGTH_SYSTEM_PROMPT = """You are a video multiple-choice question answering assistant.
+LENGTH_SYSTEM_PROMPT = """You are a video multiple-choice question answering assistant. You have learned to choose the best reasoning length for each question.
 
 Choose the appropriate reasoning length.
 
+Reasoning length selection rule:
+Use the shortest reasoning length that is sufficient to answer correctly.
+Choose Direct only when the answer is immediately clear from the video.
+Choose CoT when you need to compare options or connect a few visual clues.
+Choose Long CoT when the answer depends on multiple events, temporal order, object tracking, or combining several visual cues.
+
 Allowed outputs are exactly one of:
 
+Direct:
+Use when the answer is visually or textually obvious and does not require intermediate reasoning.
+<DIRECT>None</DIRECT>
 <ANSWER>X</ANSWER>
 
+Chain-of-Thought:
+Use when the problem requires moderate reasoning, option comparison, or a small number of evidence-grounded steps.
 <COT>...</COT>
 <ANSWER>X</ANSWER>
 
+Long Chain-of-Thought:
+Use when the problem requires multi-step reasoning, temporal ordering, event tracking, complex visual grounding, or integration of multiple cues.
 <LONG_COT>...</LONG_COT>
 <ANSWER>X</ANSWER>
 
+You must follow the format strictly.
 X must be a single option letter from A to J.
 Do NOT put explanations or option text inside <ANSWER>.
 Do NOT output anything outside the allowed tags.
+Do NOT output answer-only <ANSWER>X</ANSWER>.
 
 Example:
 User: [Video frames] Which option is correct?
@@ -73,29 +88,44 @@ Options:
 A. Red
 B. Blue
 C. Green
-Assistant: <ANSWER>B</ANSWER>
+Assistant: <DIRECT>None</DIRECT>
+<ANSWER>B</ANSWER>
 
 Now answer the question based on the video frames."""
 
 
-PERSPECTIVE_SYSTEM_PROMPT = """You are a video multiple-choice question answering assistant.
+PERSPECTIVE_SYSTEM_PROMPT = """You are a video multiple-choice question answering assistant. You have learned to choose the best reasoning perspective for each question.
 
 Choose the appropriate reasoning perspective.
 
+Perspective selection rule:
+Choose the perspective based on the evidence needed to answer correctly.
+Choose Abstract when the answer depends on the overall scene, object identity, or high-level meaning.
+Choose Temporal when the answer depends on order, timing, sequence, or change over time.
+Choose Spatiotemporal when the answer depends on motion, interaction, object location, or spatial relations across frames.
+
 Allowed outputs are exactly one of:
 
+Abstract:
+Use for conceptual, object-level, scene-level, or high-level semantic reasoning.
 <ABSTRACT>...</ABSTRACT>
 <ANSWER>X</ANSWER>
 
+Temporal:
+Use for questions involving before/after relations, ordering, sequence, duration, or changes over time.
 <TEMPORAL>...</TEMPORAL>
 <ANSWER>X</ANSWER>
 
+Spatiotemporal:
+Use for questions involving motion, spatial relations over time, object movement, physical interactions, or evidence that requires both spatial and temporal grounding.
 <SPATIOTEMPORAL>...</SPATIOTEMPORAL>
 <ANSWER>X</ANSWER>
 
+You must follow the format strictly.
 X must be a single option letter from A to J.
 Do NOT put explanations or option text inside <ANSWER>.
 Do NOT output anything outside the allowed tags.
+Do NOT output answer-only <ANSWER>X</ANSWER>.
 
 Example:
 User: [Video frames] Which option is correct?
@@ -133,13 +163,23 @@ def main() -> None:
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--test-file", type=str, required=True)
     parser.add_argument("--device", type=str, default="cuda:1")
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.60)
+    parser.add_argument(
+        "--gpu-memory-utilization",
+        type=float,
+        default=0.25,
+        help="vLLM gpu_memory_utilization (GRPO training default: VLLM_GPU_UTIL=0.25).",
+    )
     parser.add_argument("--max-model-len", type=int, default=3136)
-    parser.add_argument("--max-completion-length", type=int, default=64)
-    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--max-completion-length", type=int, default=256)
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.8,
+        help="Sampling temperature (GRPO training default: TEMPERATURE=0.8).",
+    )
     parser.add_argument("--frames-per-sample", type=int, default=16)
-    parser.add_argument("--max-pixels", type=int, default=501760)
-    parser.add_argument("--min-pixels", type=int, default=3136)
+    parser.add_argument("--max-pixels", type=int, default=100352)
+    parser.add_argument("--min-pixels", type=int, default=100352)
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--save-preds", type=str, default="")
     parser.add_argument("--save-json", type=str, default="")

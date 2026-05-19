@@ -78,12 +78,11 @@ from open_r1.trainer.qwen25_config_utils import ensure_qwen25_rope_scaling
 from open_r1.strategy import (
     build_balanced_strategy_plan,
     compute_strategy_bonus,
-    parsed_tag_to_strategy,
     strategies_for_task,
     strategy_directive,
     strategy_distribution_rates,
 )
-from open_r1.strict_answer import parse_strict_output
+from open_r1.strict_answer import normalize_gt_letter, parse_strict_output
 
 if is_peft_available():
     from peft import PeftConfig, PeftModel, get_peft_model
@@ -568,11 +567,15 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
         reasoning_task_type: str = "length",
         balanced_strategy_rollout: bool = False,
         rollouts_per_strategy: int = 3,
-        strategy_bonus_scale: float = 0.1,
-        strategy_bonus_threshold: float = 0.34,
-        tie_break_bonus_scale: float = 0.05,
+        strategy_bonus_scale: float = 0.2,
+        strategy_bonus_threshold: float = 0.10,
+        tie_break_bonus_scale: float = 0.0,
         log_strategy_metrics: bool = True,
         strategy_debug_log_path: str = "",
+        strategy_eval_every_steps: int = 0,
+        strategy_eval_max_samples: int = 60,
+        strategy_eval_batch_size: int = 8,
+        log_strategy_eval_metrics: bool = True,
     ):
 
         # Args
@@ -814,7 +817,7 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
         self.generation_config = GenerationConfig(
             max_new_tokens=self.max_completion_length,
             do_sample=True,
-            temperature=1,  # HACK
+            temperature=args.temperature,
             num_return_sequences=self.num_generations,
             pad_token_id=pad_token_id,
         )
@@ -831,6 +834,11 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
         self.tie_break_bonus_scale = float(tie_break_bonus_scale)
         self.log_strategy_metrics = bool(log_strategy_metrics)
         self.strategy_debug_log_path = str(strategy_debug_log_path or "").strip()
+        self.strategy_eval_every_steps = max(0, int(strategy_eval_every_steps))
+        self.strategy_eval_max_samples = max(1, int(strategy_eval_max_samples))
+        self.strategy_eval_batch_size = max(1, int(strategy_eval_batch_size))
+        self.log_strategy_eval_metrics = bool(log_strategy_eval_metrics)
+        self._last_strategy_eval_step = -1
         self._strategies = strategies_for_task(self.reasoning_task_type)
         if self.balanced_strategy_rollout:
             expected_G = len(self._strategies) * self.rollouts_per_strategy
@@ -1224,9 +1232,10 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                 "solution",
                 "problem",
                 "video_id",
-                "question_id",
-                "question_category",
-            ]
+            "question_id",
+            "question_category",
+            "forced_strategy",
+        ]
 
     def _safe_multimodal_processor_inputs(
         self, prompts_text: list, images: list
@@ -1346,7 +1355,11 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
             per_token_logps.append(row)
         return torch.stack(per_token_logps)
 
-    def _apply_strategy_bonus(self, base_rewards: torch.Tensor):
+    def _apply_strategy_bonus(
+        self,
+        base_rewards: torch.Tensor,
+        strategy_match_mask: Optional[torch.Tensor] = None,
+    ):
         """Thin wrapper around strategy.compute_strategy_bonus using trainer-bound config."""
         return compute_strategy_bonus(
             base_rewards=base_rewards,
@@ -1355,6 +1368,7 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
             bonus_scale=self.strategy_bonus_scale,
             bonus_threshold=self.strategy_bonus_threshold,
             tie_break_bonus_scale=self.tie_break_bonus_scale,
+            slot_eligible_mask=strategy_match_mask,
         )
 
     def _log_strategy_distribution(
@@ -1415,30 +1429,83 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
         self._metrics["strategy/reward_tie_or_unclear_rate"].append(
             float(tie_break_mask.mean().item())
         )
-
-        # tie_break_applied_rate: fraction of groups where tie-break bonus was actually applied
-        # (same as reward_tie_or_unclear_rate, but named explicitly for clarity in dashboards).
-        self._metrics["strategy/tie_break_applied_rate"].append(
+        self._metrics["strategy/tie_case_rate"].append(float(tie_break_mask.mean().item()))
+        self._metrics["strategy/no_bonus_tie_rate"].append(float(tie_break_mask.mean().item()))
+        self._metrics["strategy/effective_best_strategy_none_rate"].append(
             float(tie_break_mask.mean().item())
         )
 
-        # tie_break_to_*_rate: per strategy, fraction of ALL groups where tie-break selected it.
-        # Tie-break always selects index 0; others get 0. Useful to confirm index-0 = direct/abstract.
+        # Legacy tie-break dashboard keys are retained, but tie/unclear groups now receive no bonus.
+        self._metrics["strategy/tie_break_applied_rate"].append(0.0)
+
         for s_idx, s_name in enumerate(self._strategies):
-            if s_idx == 0:
-                rate = float(tie_break_mask.mean().item())
-            else:
-                rate = 0.0
-            self._metrics[f"strategy/tie_break_to_{s_name}_rate"].append(rate)
+            self._metrics[f"strategy/tie_break_to_{s_name}_rate"].append(0.0)
 
         # effective_best_*_rate: fraction of groups where each strategy is the effective best
-        # (actual argmax when margin >= threshold, simplest index 0 when tie-break).
-        # No gate: every group has an effective best, so clear_mask = ones.
-        ones = torch.ones(B_total, device=apply_mask.device, dtype=apply_mask.dtype)
+        # (actual argmax only when margin >= threshold; ties are counted as none).
         self._log_strategy_distribution(
             key_prefix="effective_best",
             chosen_idx=effective_best_idx,
-            clear_mask=ones,
+            clear_mask=apply_mask,
+        )
+
+    def _log_completion_strategy_metrics(
+        self,
+        completion_texts: list[str],
+        forced_strategies: list[Optional[str]],
+        solutions: list[str],
+    ) -> None:
+        if not completion_texts:
+            return
+
+        total = float(len(completion_texts))
+        parsed_counts = defaultdict(int)
+        malformed_counts = defaultdict(int)
+        per_forced = {
+            s: {"n": 0, "format_ok": 0, "match": 0, "correct": 0}
+            for s in self._strategies
+        }
+
+        for text, forced, sol in zip(completion_texts, forced_strategies, solutions):
+            parsed = parse_strict_output(text, task_type=self.reasoning_task_type)
+            parsed_strategy = parsed.parsed_strategy
+            parsed_counts[parsed_strategy] += 1
+            malformed_counts[parsed.malformed_type or "valid"] += 1
+            forced_key = str(forced or "").strip().lower()
+            if forced_key not in per_forced:
+                continue
+            gt = normalize_gt_letter(sol)
+            strategy_match = parsed_strategy == forced_key
+            pred_correct = (
+                parsed.format_ok
+                and strategy_match
+                and parsed.pred_letter is not None
+                and gt is not None
+                and parsed.pred_letter == gt
+            )
+            per_forced[forced_key]["n"] += 1
+            per_forced[forced_key]["format_ok"] += int(parsed.format_ok and strategy_match)
+            per_forced[forced_key]["match"] += int(strategy_match)
+            per_forced[forced_key]["correct"] += int(pred_correct)
+
+        for strategy, counts in per_forced.items():
+            denom = float(counts["n"] or 1)
+            self._metrics[f"strategy/format_ok/{strategy}"].append(counts["format_ok"] / denom)
+            self._metrics[f"strategy/strategy_compliance/{strategy}"].append(counts["match"] / denom)
+            self._metrics[f"strategy/answer_accuracy/{strategy}"].append(counts["correct"] / denom)
+
+        for strategy in list(self._strategies) + ["invalid"]:
+            self._metrics[f"strategy/parsed_strategy_{strategy}_rate"].append(
+                parsed_counts[strategy] / total
+            )
+        none_count = parsed_counts["invalid"]
+        self._metrics["strategy/parsed_strategy_none_rate"].append(none_count / total)
+        self._metrics["strategy/invalid_strategy_rate"].append(none_count / total)
+        self._metrics["strategy/malformed_answer_tag_rate"].append(
+            malformed_counts["malformed_answer_tag"] / total
+        )
+        self._metrics["strategy/invalid_letter_rate"].append(
+            malformed_counts["invalid_letter"] / total
         )
 
     def _write_strategy_debug_jsonl(
@@ -1467,14 +1534,15 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
         best_idx = strategy_log["best_idx"].detach().cpu()
         adv = advantages_global.detach().cpu().view(B_total, G)
 
-        # completions are local-process only; on multi-process runs this debug log captures the
-        # local slice. For batch_size=1, single-process dry-runs (the intended sanity setup),
-        # local == global.
+        # Completions are local-process only, while rewards have already been gathered globally.
+        # Main process logs only the aligned local prompt slice so parsed_strategy/base_reward rows
+        # do not mix local completion text with another rank's reward.
         local_count = min(len(completions), B_total * G)
+        local_prompt_count = min(B_total, local_count // G)
         step = int(self.state.global_step)
 
         with open(self.strategy_debug_log_path, "a", encoding="utf-8") as f:
-            for prompt_idx in range(B_total):
+            for prompt_idx in range(local_prompt_count):
                 for slot_idx in range(G):
                     flat_idx = prompt_idx * G + slot_idx
                     forced = plan[slot_idx] if slot_idx < len(plan) else None
@@ -1486,7 +1554,11 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                         else:
                             completion_text = str(c)
                     parsed = parse_strict_output(completion_text, task_type=self.reasoning_task_type)
-                    parsed_strategy = parsed_tag_to_strategy(self.reasoning_task_type, parsed.reasoning_tag)
+                    parsed_strategy = parsed.parsed_strategy
+                    best_raw = int(best_idx[prompt_idx].item())
+                    effective_raw = int(strategy_log["effective_best_idx"].detach().cpu()[prompt_idx].item())
+                    base_reward = float(base[prompt_idx, slot_idx].item())
+                    final_reward = float(final[prompt_idx, slot_idx].item())
                     row = {
                         "step": step,
                         "prompt_idx": prompt_idx,
@@ -1496,7 +1568,7 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                         "parsed_strategy": parsed_strategy,
                         "parsed_answer": parsed.pred_letter,
                         "format_ok": bool(parsed.format_ok),
-                        "base_reward": float(base[prompt_idx, slot_idx].item()),
+                        "base_reward": base_reward,
                         "strategy_mean": float(
                             strategy_mean[prompt_idx, self._strategies.index(forced)].item()
                         )
@@ -1504,9 +1576,11 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                         else None,
                         "margin": float(margin[prompt_idx].item()),
                         "bonus_applied": bool(apply_mask[prompt_idx].item() > 0.5),
-                        "final_reward": float(final[prompt_idx, slot_idx].item()),
+                        "strategy_bonus": final_reward - base_reward,
+                        "final_reward": final_reward,
                         "advantage": float(adv[prompt_idx, slot_idx].item()),
-                        "best_strategy_in_group": self._strategies[int(best_idx[prompt_idx].item())],
+                        "best_strategy_in_group": self._strategies[best_raw],
+                        "effective_best_strategy": self._strategies[effective_raw] if effective_raw >= 0 else None,
                         "completion_preview": completion_text[:200],
                     }
                     f.write(_json.dumps(row, ensure_ascii=False) + "\n")
@@ -1561,6 +1635,7 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                     strategy = self._strategy_plan_per_prompt[slot_idx]
                     ex_copy = copy.deepcopy(example)
                     ex_copy["prompt"] = self._inject_strategy_into_prompt(base_prompt, strategy)
+                    ex_copy["forced_strategy"] = strategy
                     effective_inputs.append(ex_copy)
                     strategy_ids_local.append(self._strategy_index_per_slot[slot_idx])
             self._step_strategy_ids_local = strategy_ids_local
@@ -1782,6 +1857,36 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                 for completion in completions
             ]
 
+        local_forced_strategies = [
+            example.get("forced_strategy")
+            for example in effective_inputs
+            for _ in range(_sampling_n)
+        ]
+        local_solutions = [
+            example.get("solution", "")
+            for example in effective_inputs
+            for _ in range(_sampling_n)
+        ]
+        local_completion_texts = [
+            completion[0].get("content", "")
+            if isinstance(completion, list) and completion and isinstance(completion[0], dict)
+            else str(completion)
+            for completion in completions
+        ]
+        local_strategy_match = []
+        if self.balanced_strategy_rollout:
+            for text, forced in zip(local_completion_texts, local_forced_strategies):
+                parsed = parse_strict_output(text, task_type=self.reasoning_task_type)
+                local_strategy_match.append(float(parsed.parsed_strategy == forced))
+            all_completion_texts_for_metrics = gather_object(local_completion_texts)
+            all_forced_for_metrics = gather_object(local_forced_strategies)
+            all_solutions_for_metrics = gather_object(local_solutions)
+        else:
+            local_strategy_match = [1.0] * len(local_completion_texts)
+            all_completion_texts_for_metrics = []
+            all_forced_for_metrics = []
+            all_solutions_for_metrics = []
+
         # Compute the rewards
         prompts = [prompt for prompt in prompts for _ in range(_sampling_n)]
         rewards_per_func = torch.zeros(
@@ -1814,7 +1919,7 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                 # In balanced mode effective_inputs already has B*G entries, so _sampling_n=1 keeps total at B*G.
                 reward_kwargs = {
                     key: []
-                    for key in inputs[0].keys()
+                    for key in effective_inputs[0].keys()
                     if key not in ["prompt", "completion"]
                 }
                 for key in reward_kwargs:
@@ -1832,12 +1937,20 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
         )
         # Weighted sum of rewards from all reward functions (base reward, shape (B_total*G,)).
         rewards = (rewards_per_func * reward_weights.unsqueeze(0)).sum(dim=1)
+        if self.balanced_strategy_rollout:
+            strategy_match_mask = torch.tensor(
+                local_strategy_match, dtype=rewards.dtype, device=device
+            )
+            strategy_match_mask = gather(strategy_match_mask).to(device=rewards.device, dtype=rewards.dtype)
+            rewards = rewards * strategy_match_mask
+        else:
+            strategy_match_mask = None
         base_rewards = rewards.clone()
 
         # Strategy-relative reward shaping (only when balanced rollout is on).
         # Applied INSIDE the same prompt group; the GRPO loss/KL/clipping path is untouched.
         if self.balanced_strategy_rollout:
-            rewards, _strategy_log = self._apply_strategy_bonus(rewards)
+            rewards, _strategy_log = self._apply_strategy_bonus(rewards, strategy_match_mask)
         else:
             _strategy_log = None
 
@@ -1877,6 +1990,12 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
 
         if self.balanced_strategy_rollout and _strategy_log is not None and self.log_strategy_metrics:
             self._log_strategy_metrics(base_rewards, _strategy_log)
+            if self.accelerator.is_main_process:
+                self._log_completion_strategy_metrics(
+                    completion_texts=all_completion_texts_for_metrics,
+                    forced_strategies=all_forced_for_metrics,
+                    solutions=all_solutions_for_metrics,
+                )
         if (
             self.balanced_strategy_rollout
             and _strategy_log is not None
@@ -1890,6 +2009,7 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                 completions=completions,
                 strategy_log=_strategy_log,
             )
+        self._run_periodic_strategy_eval()
 
         return {
             "prompt_ids": prompt_ids,
@@ -1970,40 +2090,52 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
 
         return loss
 
-    def run_test_inference(self) -> list[tuple[dict, str]]:
+    def run_test_inference(
+        self,
+        forced_strategy: Optional[str] = None,
+        max_samples: Optional[int] = None,
+        batch_size: int = 8,
+        reload_model_weights: bool = True,
+    ) -> list[tuple[dict, str]]:
         """Run inference on eval_dataset (main process only), return list of (example_dict, completion_text)."""
         if not self.accelerator.is_main_process or self.eval_dataset is None:
             return []
 
-        # Force sync latest model weights to vLLM
-        self._last_loaded_step = -1
-        with unwrap_model_for_generation(
-            self.model,
-            self.accelerator,
-            gather_deepspeed3_params=False,
-        ) as unwrapped_model:
-            if is_compiled_module(unwrapped_model):
-                state_dict = unwrapped_model._orig_mod.state_dict()
-            else:
-                state_dict = unwrapped_model.state_dict()
-        lora_alpha = _get_lora_alpha_from_model(self.model)
-        if any(".base_layer." in k for k in state_dict):
-            remapped_items = _peft_state_dict_to_merged_state_dict(
-                state_dict, lora_alpha_override=lora_alpha
+        if forced_strategy is not None and forced_strategy not in self._strategies:
+            raise ValueError(
+                f"forced_strategy must be one of {self._strategies}, got {forced_strategy!r}"
             )
-        else:
-            remapped_items = []
-            for key, value in state_dict.items():
-                if key.startswith("base_model.model."):
-                    key = key[len("base_model.model.") :]
-                elif key.startswith("base_model."):
-                    key = key[len("base_model.") :]
-                remapped_items.append((key, value))
-        llm_model = (
-            self.llm.llm_engine.model_executor.driver_worker.model_runner.model
-        )
-        llm_model.load_weights(_filter_vllm_incompatible_weight_keys(remapped_items))
-        self._last_loaded_step = self.state.global_step
+
+        if reload_model_weights:
+            # Force sync latest model weights to vLLM
+            self._last_loaded_step = -1
+            with unwrap_model_for_generation(
+                self.model,
+                self.accelerator,
+                gather_deepspeed3_params=False,
+            ) as unwrapped_model:
+                if is_compiled_module(unwrapped_model):
+                    state_dict = unwrapped_model._orig_mod.state_dict()
+                else:
+                    state_dict = unwrapped_model.state_dict()
+            lora_alpha = _get_lora_alpha_from_model(self.model)
+            if any(".base_layer." in k for k in state_dict):
+                remapped_items = _peft_state_dict_to_merged_state_dict(
+                    state_dict, lora_alpha_override=lora_alpha
+                )
+            else:
+                remapped_items = []
+                for key, value in state_dict.items():
+                    if key.startswith("base_model.model."):
+                        key = key[len("base_model.model.") :]
+                    elif key.startswith("base_model."):
+                        key = key[len("base_model.") :]
+                    remapped_items.append((key, value))
+            llm_model = (
+                self.llm.llm_engine.model_executor.driver_worker.model_runner.model
+            )
+            llm_model.load_weights(_filter_vllm_incompatible_weight_keys(remapped_items))
+            self._last_loaded_step = self.state.global_step
 
         sampling_params = copy.deepcopy(self.sampling_params)
         sampling_params.n = 1
@@ -2011,10 +2143,16 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
         # Test can use more frames than train (e.g. train 8, test 16). Env: VLLM_MAX_FRAMES_EVAL.
         eval_max_frames = int(os.getenv("VLLM_MAX_FRAMES_EVAL", str(self.vllm_max_frames)))
 
+        total_eval = len(self.eval_dataset)
+        if max_samples is not None:
+            total_eval = min(total_eval, int(max_samples))
+
         results = []
-        batch_size = 8
-        for start in range(0, len(self.eval_dataset), batch_size):
-            batch = [self.eval_dataset[i] for i in range(start, min(start + batch_size, len(self.eval_dataset)))]
+        for start in range(0, total_eval, batch_size):
+            batch = [
+                self.eval_dataset[i]
+                for i in range(start, min(start + batch_size, total_eval))
+            ]
             # Normalize: reduce frames to eval_max_frames and rebuild prompt so placeholder count matches.
             normalized_batch = []
             for ex in batch:
@@ -2037,6 +2175,10 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                         ex_copy["prompt"][0],
                         {"role": "user", "content": [{"type": "image"} for _ in reduced] + [{"type": "text", "text": text_part}]},
                     ]
+                if forced_strategy is not None:
+                    ex_copy["prompt"] = self._inject_strategy_into_prompt(
+                        ex_copy["prompt"], forced_strategy
+                    )
                 normalized_batch.append(ex_copy)
             images = [x["image_vllm"] for x in normalized_batch]
             prompts_text = [
@@ -2093,6 +2235,70 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                 }
                 results.append((example_dict, completion_texts[i]))
         return results
+
+    def _run_periodic_strategy_eval(self) -> None:
+        if (
+            not self.accelerator.is_main_process
+            or self.eval_dataset is None
+            or self.strategy_eval_every_steps <= 0
+            or not self.log_strategy_eval_metrics
+        ):
+            return
+
+        step = int(self.state.global_step)
+        if (
+            step <= 0
+            or step % self.strategy_eval_every_steps != 0
+            or step == self._last_strategy_eval_step
+        ):
+            return
+
+        self._last_strategy_eval_step = step
+
+        for idx, strategy in enumerate(self._strategies):
+            examples_completions = self.run_test_inference(
+                forced_strategy=strategy,
+                max_samples=self.strategy_eval_max_samples,
+                batch_size=self.strategy_eval_batch_size,
+                reload_model_weights=(idx == 0),
+            )
+            total = len(examples_completions)
+            if total == 0:
+                continue
+
+            correct = 0
+            strict_correct = 0
+            format_ok_count = 0
+            strategy_match_count = 0
+
+            for example, pred_raw in examples_completions:
+                parsed = parse_strict_output(pred_raw, task_type=self.reasoning_task_type)
+                gt = normalize_gt_letter(example.get("solution", ""))
+                parsed_strategy = parsed.parsed_strategy
+                pred_correct = (
+                    parsed.format_ok
+                    and parsed.pred_letter is not None
+                    and gt is not None
+                    and parsed.pred_letter == gt
+                )
+                strategy_match = parsed_strategy == strategy
+
+                format_ok_count += int(parsed.format_ok)
+                strategy_match_count += int(strategy_match)
+                correct += int(pred_correct)
+                strict_correct += int(pred_correct and strategy_match)
+
+            denom = float(total)
+            self._metrics[f"strategy_eval/{strategy}_accuracy"].append(correct / denom)
+            self._metrics[f"strategy_eval/{strategy}_strict_accuracy"].append(
+                strict_correct / denom
+            )
+            self._metrics[f"strategy_eval/{strategy}_format_rate"].append(
+                format_ok_count / denom
+            )
+            self._metrics[f"strategy_eval/{strategy}_match_rate"].append(
+                strategy_match_count / denom
+            )
 
     def log(self, logs: dict[str, float], start_time: Optional[float] = None) -> None:
         metrics = {key: sum(val) / len(val) for key, val in self._metrics.items()}  # average the metrics

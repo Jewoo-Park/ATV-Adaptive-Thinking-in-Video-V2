@@ -93,8 +93,8 @@ def A_static_code_verification():
     for line, expect in [
         ('balanced_strategy_rollout: bool = field(', 'default=False'),
         ('rollouts_per_strategy: int = field(', 'default=3'),
-        ('strategy_bonus_scale: float = field(', 'default=0.1'),
-        ('strategy_bonus_threshold: float = field(', 'default=0.34'),
+        ('strategy_bonus_scale: float = field(', 'default=0.2'),
+        ('strategy_bonus_threshold: float = field(', 'default=0.10'),
         ('log_strategy_metrics: bool = field(', 'default=True'),
         ('strategy_debug_log_path: str = field(', 'default=""'),
     ]:
@@ -119,8 +119,8 @@ def A_static_code_verification():
     for needle in [
         "balanced_strategy_rollout: bool = False,",
         "rollouts_per_strategy: int = 3,",
-        "strategy_bonus_scale: float = 0.1,",
-        "strategy_bonus_threshold: float = 0.34,",
+        "strategy_bonus_scale: float = 0.2,",
+        "strategy_bonus_threshold: float = 0.10,",
         "log_strategy_metrics: bool = True,",
         'strategy_debug_log_path: str = "",',
         "reasoning_task_type: str = \"length\",",
@@ -174,7 +174,7 @@ def A_static_code_verification():
         "rewards = (rewards_per_func * reward_weights.unsqueeze(0)).sum(dim=1)"
     )
     shape_pos = trainer_src.find(
-        "rewards, _strategy_log = self._apply_strategy_bonus(rewards)"
+        "rewards, _strategy_log = self._apply_strategy_bonus(rewards, strategy_match_mask)"
     )
     group_pos = trainer_src.find(
         "mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)"
@@ -383,7 +383,7 @@ def D_directive_injection():
 
     subsection("D.4 Directive ↔ strict-parser tag alignment")
     pairs_length = [
-        ("direct", "<ANSWER>", "Direct Answer"),
+        ("direct", "<DIRECT>", "<ANSWER>"),
         ("cot", "<COT>", "<ANSWER>"),
         ("long_cot", "<LONG_COT>", "<ANSWER>"),
     ]
@@ -417,6 +417,7 @@ def _simulate_effective_inputs(reasoning_task_type, inputs, num_generations, rol
             strategy = plan[slot_idx]
             ex_copy = copy.deepcopy(example)
             ex_copy["prompt"] = _inject_strategy_into_prompt_replica(reasoning_task_type, base_prompt, strategy)
+            ex_copy["forced_strategy"] = strategy
             effective_inputs.append(ex_copy)
             strategy_ids_local.append(strategy_index_per_slot[slot_idx])
     return effective_inputs, strategy_ids_local, plan
@@ -460,7 +461,7 @@ def E_effective_inputs():
         for kw in (s,):
             pass  # already covered in D.4
         # presence of the matching tag is the strongest signal:
-        tag = {"direct": "Direct Answer", "cot": "<COT>", "long_cot": "<LONG_COT>"}[s]
+        tag = {"direct": "<DIRECT>", "cot": "<COT>", "long_cot": "<LONG_COT>"}[s]
         check(tag in sys_text and "SYS-0" in sys_text,
               f"slot {i} system carries {tag} + base SYS-0")
 
@@ -552,7 +553,7 @@ def F_sampling_n_table():
 # G. Reward shaping math
 # ---------------------------------------------------------------------------
 
-def _bonus(task: str, base: torch.Tensor, alpha: float = 0.1, threshold: float = 0.34):
+def _bonus(task: str, base: torch.Tensor, alpha: float = 0.2, threshold: float = 0.10):
     strategies = strategies_for_task(task)
     plan = build_balanced_strategy_plan(task, base.numel() // (base.numel() // len(strategies) // (base.numel() // (len(strategies) * 3))), 3) if False else None
     G = len(strategies) * 3
@@ -575,23 +576,23 @@ def G_reward_shaping_math():
     final, log = _bonus("length", base)
     overall = (1.0 + 0.0 + 0.5) / 3
     expect = torch.tensor(
-        [1.0 + 0.1 * (1.0 - overall)] * 3
-        + [0.0 + 0.1 * (0.0 - overall)] * 3
-        + [0.5 + 0.1 * (0.5 - overall)] * 3
+        [1.0 + 0.2 * (1.0 - overall)] * 3
+        + [0.0 + 0.2 * (0.0 - overall)] * 3
+        + [0.5 + 0.2 * (0.5 - overall)] * 3
     )
     check(torch.allclose(final, expect, atol=1e-6),
           f"final = {final.tolist()} ≈ expected {expect.tolist()}")
-    check(log["margin"].item() > 0.34, "margin > threshold")
+    check(log["margin"].item() > 0.10, "margin > threshold")
     check(log["best_idx"].item() == 0, "best_idx = 0 (direct)")
     check(abs(log["bonus_per_strategy"][0].sum().item()) < 1e-5,
           "per-group bonus zero-sum across S")
 
     subsection("G.2 Case 2 — margin below threshold")
-    base = torch.tensor([0.6] * 3 + [0.5] * 3 + [0.4] * 3)
+    base = torch.tensor([0.6] * 3 + [0.55] * 3 + [0.5] * 3)
     final, log = _bonus("length", base)
     check(torch.allclose(final, base), "final == base (gate suppressed)")
     check(log["apply_mask"].item() == 0.0, "apply_mask == 0.0")
-    check(abs(log["margin"].item() - 0.1) < 1e-6, "margin ≈ 0.1")
+    check(abs(log["margin"].item() - 0.05) < 1e-6, "margin ≈ 0.05")
 
     subsection("G.3 Case 3 — B=2 group independence")
     # group 0: direct best. group 1: long_cot best.
@@ -611,9 +612,9 @@ def G_reward_shaping_math():
     # group 0 slot 0 (direct) bonus = alpha * (1.0 - overall0)
     overall0 = (1.0 + 0.0 + 0.5) / 3
     overall1 = (0.0 + 0.2 + 0.9) / 3
-    check(abs(delta[0, 0].item() - 0.1 * (1.0 - overall0)) < 1e-6,
+    check(abs(delta[0, 0].item() - 0.2 * (1.0 - overall0)) < 1e-6,
           "group 0 direct bonus matches group 0 means only")
-    check(abs(delta[1, 6].item() - 0.1 * (0.9 - overall1)) < 1e-6,
+    check(abs(delta[1, 6].item() - 0.2 * (0.9 - overall1)) < 1e-6,
           "group 1 long_cot bonus matches group 1 means only (no cross-mixing)")
 
     subsection("G.4 Case 4 — bonus is zero-mean within each group")
@@ -672,7 +673,7 @@ def H_final_to_advantage():
     # The trainer's actual code path: rewards = self._apply_strategy_bonus(rewards); use rewards for advantage.
     # We verify this textually:
     trainer_src = _read(TRAINER_PATH)
-    shape_idx = trainer_src.find('rewards, _strategy_log = self._apply_strategy_bonus(rewards)')
+    shape_idx = trainer_src.find('rewards, _strategy_log = self._apply_strategy_bonus(rewards, strategy_match_mask)')
     group_idx = trainer_src.find('mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)')
     adv_idx = trainer_src.find('advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)')
     check(shape_idx != -1 and group_idx != -1 and adv_idx != -1, "all anchors present")
@@ -699,8 +700,8 @@ class _MetricsHarness:
     def __init__(self, task_type: str):
         self.reasoning_task_type = task_type
         self._strategies = strategies_for_task(task_type)
-        self.strategy_bonus_scale = 0.1
-        self.strategy_bonus_threshold = 0.34
+        self.strategy_bonus_scale = 0.2
+        self.strategy_bonus_threshold = 0.10
         self.num_generations = 9
         self.rollouts_per_strategy = 3
         plan = build_balanced_strategy_plan(task_type, 9, 3)
@@ -746,7 +747,7 @@ def I_logging_keys():
         0.0, 0.0, 0.0, 0.9, 0.9, 0.9, 0.4, 0.4, 0.4,
         0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5,
     ])
-    final, log = compute_strategy_bonus(base, h._strategy_index_per_slot, len(h._strategies), 0.1, 0.34)
+    final, log = compute_strategy_bonus(base, h._strategy_index_per_slot, len(h._strategies), 0.2, 0.10)
     h._log_strategy_metrics(base, log)
     m = {k: v[-1] for k, v in h._metrics.items()}
     expected = [
@@ -777,7 +778,7 @@ def I_logging_keys():
         0.2, 0.2, 0.2, 0.9, 0.9, 0.9, 0.4, 0.4, 0.4,
         0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3,
     ])
-    final, log = compute_strategy_bonus(base, h._strategy_index_per_slot, len(h._strategies), 0.1, 0.34)
+    final, log = compute_strategy_bonus(base, h._strategy_index_per_slot, len(h._strategies), 0.2, 0.10)
     h._log_strategy_metrics(base, log)
     m = {k: v[-1] for k, v in h._metrics.items()}
     expected = [
@@ -830,7 +831,7 @@ def _write_strategy_debug_jsonl_replica(state_step, reasoning_task_type, strateg
                     else:
                         completion_text = str(c)
                 parsed = parse_strict_output(completion_text, task_type=reasoning_task_type)
-                parsed_strategy = parsed_tag_to_strategy(reasoning_task_type, parsed.reasoning_tag)
+                parsed_strategy = parsed.parsed_strategy
                 row = {
                     "step": int(state_step),
                     "prompt_idx": prompt_idx,
@@ -869,7 +870,7 @@ def J_debug_jsonl():
             if (prompt_idx * 9 + slot_idx) % 3 == 0:
                 # 'compliant' output per strategy
                 if strat == "direct":
-                    body = "<ANSWER>A</ANSWER>"
+                    body = "<DIRECT>None</DIRECT>\n<ANSWER>A</ANSWER>"
                 elif strat == "cot":
                     body = "<COT>short</COT>\n<ANSWER>B</ANSWER>"
                 else:
@@ -882,7 +883,7 @@ def J_debug_jsonl():
         1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.5, 0.5, 0.5,
         0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5,
     ])
-    final, log = compute_strategy_bonus(base, sids, len(strategies), 0.1, 0.34)
+    final, log = compute_strategy_bonus(base, sids, len(strategies), 0.2, 0.10)
     advantages = torch.linspace(-1.0, 1.0, 18)
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -924,7 +925,7 @@ def J_debug_jsonl():
                 f"compliant row: forced={r['forced_strategy']} parsed={r['parsed_strategy']} format_ok={r['format_ok']}",
             )
 
-        # First group bonus applied (margin > 0.34), second group not.
+        # First group bonus applied (margin > 0.10), second group not.
         check(rows[0]["bonus_applied"] is True and rows[9]["bonus_applied"] is False,
               "bonus_applied flag tracks margin gate per group")
 
@@ -942,14 +943,16 @@ def K_strict_parser():
     section("K. Strict parser compatibility")
 
     valid_length = [
-        ("<ANSWER>A</ANSWER>", None, "A"),
+        ("<DIRECT>None</DIRECT>\n<ANSWER>A</ANSWER>", "DIRECT", "A", "direct"),
         ("<COT>short reasoning</COT>\n<ANSWER>B</ANSWER>", "COT", "B"),
         ("<LONG_COT>detailed reasoning here</LONG_COT>\n<ANSWER>C</ANSWER>", "LONG_COT", "C"),
     ]
-    for text, expect_tag, expect_letter in valid_length:
+    for item in valid_length:
+        text, expect_tag, expect_letter = item[:3]
+        expect_strategy = item[3] if len(item) > 3 else parsed_tag_to_strategy("length", expect_tag)
         r = parse_strict_output(text, task_type="length")
-        check(r.format_ok and r.reasoning_tag == expect_tag and r.pred_letter == expect_letter,
-              f"LENGTH valid: {text!r} -> tag={r.reasoning_tag}, letter={r.pred_letter}")
+        check(r.format_ok and r.reasoning_tag == expect_tag and r.pred_letter == expect_letter and r.parsed_strategy == expect_strategy,
+              f"LENGTH valid: {text!r} -> tag={r.reasoning_tag}, letter={r.pred_letter}, strategy={r.parsed_strategy}")
 
     valid_persp = [
         ("<ABSTRACT>concept-level reasoning</ABSTRACT>\n<ANSWER>A</ANSWER>", "ABSTRACT", "A"),
@@ -965,20 +968,27 @@ def K_strict_parser():
     r = parse_strict_output("<ABSTRACT>foo</ABSTRACT>\n<ANSWER>A</ANSWER>", task_type="length")
     check(not r.format_ok, "LENGTH + ABSTRACT tag -> format_ok=False")
 
-    # FINDING (not a verifier bug, but an issue worth flagging):
-    # parse_strict_output's answer-only branch always returns format_ok=True regardless of
-    # task_type (strict_answer.py:108-116). So in PERSPECTIVE mode, a model that ignores the
-    # forced directive and emits "<ANSWER>A</ANSWER>" still earns answer_format=1.
     r = parse_strict_output("<ANSWER>A</ANSWER>", task_type="perspective")
     check(
-        r.format_ok and r.reasoning_tag is None,
-        "[FINDING] PERSPECTIVE + answer-only: parser accepts (format_ok=True), "
-        "reasoning_tag=None -> parsed_tag_to_strategy returns None",
+        not r.format_ok
+        and r.pred_letter is None
+        and r.reasoning_tag is None
+        and r.malformed_type == "missing_perspective_reasoning_tag",
+        "PERSPECTIVE + answer-only -> format_ok=False",
+    )
+    r = parse_strict_output("<ANSWER>A</ANSWER>", task_type="length")
+    check(
+        not r.format_ok
+        and r.pred_letter is None
+        and r.reasoning_tag is None
+        and r.parsed_strategy == "invalid"
+        and r.malformed_type == "missing_length_reasoning_tag",
+        "LENGTH + answer-only -> format_ok=False",
     )
     parsed_strat = parsed_tag_to_strategy("perspective", r.reasoning_tag)
     check(
         parsed_strat is None,
-        "PERSPECTIVE answer-only does NOT map to any perspective strategy (parsed_strategy=None)",
+        "PERSPECTIVE answer-only remains unmapped to any perspective strategy",
     )
 
     r = parse_strict_output("<ANSWER>cat</ANSWER>", task_type="length")
@@ -1009,7 +1019,7 @@ def L_regression_safety():
     )
     # Reward shaping is gated.
     check(
-        "if self.balanced_strategy_rollout:\n            rewards, _strategy_log = self._apply_strategy_bonus(rewards)"
+        "if self.balanced_strategy_rollout:\n            rewards, _strategy_log = self._apply_strategy_bonus(rewards, strategy_match_mask)"
         in trainer_src,
         "shaping call gated on balanced flag (no shaping in free)",
     )

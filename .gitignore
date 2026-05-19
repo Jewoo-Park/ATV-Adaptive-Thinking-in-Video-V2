@@ -1,18 +1,23 @@
 __pycache__/
+*.egg-info/
 *.pyc
 *.pyo
 *.log
 .env
 .venv/
 venv/
+venv_grpo/
+.venv_grpo*/
 
 data/
 outputs/
+results/
 checkpoints/
 wandb/
 runs/
 cache/
 tmp/
+tmp_smoke/
 models/
 memory/
 .claude/

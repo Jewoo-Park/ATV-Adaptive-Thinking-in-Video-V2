@@ -387,7 +387,7 @@ python src/scripts/verify_balanced_strategy_rollout.py
 
 - balanced 모드는 `use_vllm=true`가 필수입니다. HF generation 경로는 미지원이며, false 상태에서 `--balanced_strategy_rollout true`를 주면 즉시 `ValueError`.
 - `num_generations`는 반드시 strategy 수(현재 3) × `rollouts_per_strategy`와 일치해야 합니다. 그 외 값은 trainer `__init__`에서 거부됩니다.
-- PERSPECTIVE 모드에서 `<ANSWER>X</ANSWER>` 단독 출력은 strict parser상 `format_ok=True`로 통과합니다 ([strict_answer.py:108-116](src/r1-v/src/open_r1/strict_answer.py#L108-L116)의 answer-only 분기). 모델이 강제 directive를 무시하고 answer-only로 collapse할 수 있어, 학습 초반에는 debug JSONL의 `parsed_strategy == None` 비율을 함께 모니터링하는 것이 좋습니다. 필요 시 parser를 PERSPECTIVE에서 answer-only를 거부하도록 한 줄 추가하면 됩니다.
+- PERSPECTIVE 모드에서 `<ANSWER>X</ANSWER>` 단독 출력은 strict parser상 `format_ok=False`로 거부됩니다. 유효한 PERSPECTIVE 출력은 `<ABSTRACT>...</ABSTRACT><ANSWER>X</ANSWER>`, `<TEMPORAL>...</TEMPORAL><ANSWER>X</ANSWER>`, `<SPATIOTEMPORAL>...</SPATIOTEMPORAL><ANSWER>X</ANSWER>` 형식입니다. LENGTH의 direct-answer 출력 `<ANSWER>X</ANSWER>`는 계속 허용됩니다.
 - 단일 process(`NUM_GPUS=1`) 환경에선 debug JSONL이 모든 slot을 다 캡처하지만, DDP 환경에서는 main process가 본 local prompt의 completion만 채워집니다. 전체를 보고 싶다면 batch_size=1, single-process로 1 step만 돌리는 것을 권장합니다.
 
 ---
