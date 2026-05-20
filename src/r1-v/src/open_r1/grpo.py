@@ -1,11 +1,13 @@
 import json
 import os
 import re
+import warnings
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
 from datasets import load_dataset
+import torch
 
 from open_r1.trainer import Qwen2VLGRPOTrainer, Qwen2VLGRPOVLLMTrainerModified
 from trl import GRPOConfig, ModelConfig, ScriptArguments, TrlParser, get_peft_config
@@ -321,6 +323,11 @@ def system_prompt_for_task(task_type: str) -> str:
 
 
 def main(script_args, training_args, model_args):
+    # Suppress repeated FA2 dtype warnings emitted by transformers internals on each rank.
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Flash Attention 2 only supports torch\.float16 and torch\.bfloat16 dtypes.*",
+    )
     reasoning_task_type = str(script_args.reasoning_task_type or "length").strip().lower()
     if reasoning_task_type not in {"length", "perspective"}:
         raise ValueError("--reasoning_task_type must be either 'length' or 'perspective'")
@@ -330,6 +337,18 @@ def main(script_args, training_args, model_args):
     # Bridge TRL ModelConfig quantization flags (e.g. --load_in_8bit/--load_in_4bit)
     # into trainer args so model_init_kwargs reach from_pretrained().
     model_init_kwargs = dict(getattr(training_args, "model_init_kwargs", {}) or {})
+    # Ensure HF model load uses mixed precision dtype so FlashAttention2 does not
+    # fall back to fp32 vision blocks.
+    _resolved_dtype = (
+        getattr(model_args, "torch_dtype", None)
+        or getattr(training_args, "torch_dtype", None)
+    )
+    if _resolved_dtype and _resolved_dtype != "auto" and "torch_dtype" not in model_init_kwargs:
+        if isinstance(_resolved_dtype, str):
+            _mapped = getattr(torch, _resolved_dtype, None)
+            model_init_kwargs["torch_dtype"] = _mapped if _mapped is not None else _resolved_dtype
+        else:
+            model_init_kwargs["torch_dtype"] = _resolved_dtype
     quantization_config = get_quantization_config(model_args)
     if quantization_config is not None:
         model_init_kwargs["quantization_config"] = quantization_config

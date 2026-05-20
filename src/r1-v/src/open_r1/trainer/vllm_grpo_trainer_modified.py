@@ -16,6 +16,7 @@ import functools
 import logging
 import math
 import os
+import time
 import textwrap
 import importlib
 import inspect
@@ -192,6 +193,15 @@ def _vllm_grpo_hf_overrides_for_qwen_vl(hf_config: Any) -> Any:
     raw JSON from model.name_or_path. Reuse coerce + optional base config copy.
     """
     hf_config = _coerce_qwen25_text_config(hf_config)
+    # Some merged exports lose architectures metadata after config coercion.
+    # vLLM registry requires a non-empty iterable for architectures.
+    arch = getattr(hf_config, "architectures", None)
+    if not arch:
+        setattr(
+            hf_config,
+            "architectures",
+            ["Qwen2_5_VLForConditionalGeneration"],
+        )
     tc = getattr(hf_config, "text_config", None)
     if tc is not None and hasattr(tc, "num_attention_heads"):
         return hf_config
@@ -218,6 +228,10 @@ def _vllm_grpo_hf_overrides_for_qwen_vl(hf_config: Any) -> Any:
             local_files_only=local_only,
         )
         base_cfg = _coerce_qwen25_text_config(base_cfg)
+        if not getattr(hf_config, "architectures", None):
+            base_arch = getattr(base_cfg, "architectures", None)
+            if base_arch:
+                hf_config.architectures = base_arch
         if getattr(base_cfg, "text_config", None) is not None:
             hf_config.text_config = base_cfg.text_config
     except Exception as exc:
@@ -460,6 +474,7 @@ def _peft_state_dict_to_merged_state_dict(
     state_dict: dict[str, torch.Tensor],
     prefix_strip: str = "base_model.model.",
     lora_alpha_override: Optional[float] = None,
+    select_sync_candidates_only: bool = True,
 ) -> list[tuple[str, torch.Tensor]]:
     """
     Convert a PEFT model state_dict (with base_layer / lora_A / lora_B keys) into a
@@ -470,11 +485,7 @@ def _peft_state_dict_to_merged_state_dict(
         return []
 
     def strip_prefix(k: str) -> str:
-        if prefix_strip and k.startswith(prefix_strip):
-            return k[len(prefix_strip) :]
-        if k.startswith("base_model."):
-            return k[len("base_model.") :]
-        return k
+        return _normalize_vllm_sync_input_key(k, prefix_strip=prefix_strip)
 
     # Collect keys and decide what to emit
     out: dict[str, torch.Tensor] = {}
@@ -484,6 +495,10 @@ def _peft_state_dict_to_merged_state_dict(
         if "lora_A" in key or "lora_B" in key:
             continue
         short = strip_prefix(key)
+        # Fast path: only keep keys that could ever be synced to vLLM.
+        # This avoids merging/scanning unrelated full-model weights every step.
+        if select_sync_candidates_only and not _is_vllm_sync_candidate_key(short):
+            continue
         if ".base_layer.weight" in key:
             base_short = short.replace(".base_layer.weight", ".weight")
             lora_a_key = key.replace(".base_layer.weight", ".lora_A.default.weight")
@@ -533,10 +548,239 @@ def _filter_vllm_incompatible_weight_keys(
     """
     filtered: list[tuple[str, torch.Tensor]] = []
     for key, value in items:
+        key = _normalize_vllm_sync_input_key(key)
         if key.endswith(".SCB") or key.endswith(".weight_format") or ".SCB." in key:
+            continue
+        if not _is_vllm_sync_candidate_key(key):
             continue
         filtered.append((key, value))
     return filtered
+
+
+def _is_vllm_sync_candidate_key(key: str) -> bool:
+    """Return True only for language-side projection keys that GRPO LoRA can update."""
+    if key.startswith("visual.") or key.startswith("model.visual."):
+        return False
+    lora_target_markers = (
+        ".q_proj.",
+        ".k_proj.",
+        ".v_proj.",
+        ".o_proj.",
+        ".gate_proj.",
+        ".up_proj.",
+        ".down_proj.",
+    )
+    return any(marker in key for marker in lora_target_markers)
+
+
+def _build_legacy_sync_items_from_state_dict(
+    state_dict: dict[str, torch.Tensor],
+    lora_alpha_override: Optional[float],
+) -> list[tuple[str, torch.Tensor]]:
+    """Previous safe path: full remap then filter."""
+    if any(".base_layer." in k for k in state_dict):
+        remapped = _peft_state_dict_to_merged_state_dict(
+            state_dict,
+            lora_alpha_override=lora_alpha_override,
+            select_sync_candidates_only=False,
+        )
+    else:
+        remapped = []
+        for key, value in state_dict.items():
+            if key.startswith("base_model.model."):
+                key = key[len("base_model.model.") :]
+            elif key.startswith("base_model."):
+                key = key[len("base_model.") :]
+            remapped.append((key, value))
+    return _filter_vllm_incompatible_weight_keys(remapped)
+
+
+def _build_plain_sync_specs_from_state_dict(
+    state_dict: dict[str, torch.Tensor],
+) -> list[tuple[str, str, str, str, str]]:
+    """Build direct sync specs without full remap scan each step.
+
+    Spec tuple: (kind, out_key, base_key, lora_a_key, lora_b_key)
+    For direct keys, only out_key/base_key are used.
+    """
+    specs: list[tuple[str, str, str, str, str]] = []
+    seen: set[str] = set()
+    for src_key in state_dict.keys():
+        out_key = _normalize_vllm_sync_input_key(src_key)
+        if not _is_vllm_sync_candidate_key(out_key):
+            continue
+        if out_key in seen:
+            continue
+        seen.add(out_key)
+        specs.append(("direct", out_key, src_key, "", ""))
+    return specs
+
+
+def _build_peft_sync_specs_from_state_dict(
+    state_dict: dict[str, torch.Tensor],
+) -> list[tuple[str, str, str, str, str]]:
+    """Build PEFT merge specs with candidate-only selection.
+
+    Spec tuple: (kind, out_key, base_key, lora_a_key, lora_b_key)
+    kind is one of: merged_weight, direct_bias, direct
+    """
+    specs: list[tuple[str, str, str, str, str]] = []
+    seen: set[str] = set()
+    for key in state_dict.keys():
+        if "lora_A" in key or "lora_B" in key:
+            continue
+        short = _normalize_vllm_sync_input_key(key, prefix_strip="base_model.model.")
+        if not _is_vllm_sync_candidate_key(short):
+            continue
+        if ".base_layer.weight" in key:
+            out_key = short.replace(".base_layer.weight", ".weight")
+            if out_key in seen:
+                continue
+            seen.add(out_key)
+            specs.append(
+                (
+                    "merged_weight",
+                    out_key,
+                    key,
+                    key.replace(".base_layer.weight", ".lora_A.default.weight"),
+                    key.replace(".base_layer.weight", ".lora_B.default.weight"),
+                )
+            )
+            continue
+        if ".base_layer.bias" in key:
+            out_key = short.replace(".base_layer.bias", ".bias")
+            if out_key in seen:
+                continue
+            seen.add(out_key)
+            specs.append(("direct_bias", out_key, key, "", ""))
+            continue
+        out_key = short
+        if out_key in seen:
+            continue
+        seen.add(out_key)
+        specs.append(("direct", out_key, key, "", ""))
+    return specs
+
+
+def _materialize_sync_items_from_specs(
+    state_dict: dict[str, torch.Tensor],
+    specs: list[tuple[str, str, str, str, str]],
+    lora_alpha_override: Optional[float],
+) -> tuple[list[tuple[str, torch.Tensor]], float, float]:
+    """Materialize current tensors from cached sync specs.
+
+    Returns: (items, tensor_fetch_time_s, peft_merge_time_s)
+    """
+    t_fetch = 0.0
+    t_merge = 0.0
+    out: list[tuple[str, torch.Tensor]] = []
+    for kind, out_key, base_key, lora_a_key, lora_b_key in specs:
+        t0 = time.perf_counter()
+        base_w = state_dict[base_key]
+        t_fetch += time.perf_counter() - t0
+        if kind == "merged_weight":
+            if lora_a_key in state_dict and lora_b_key in state_dict:
+                t0 = time.perf_counter()
+                lora_a = state_dict[lora_a_key]
+                lora_b = state_dict[lora_b_key]
+                r = lora_a.shape[0]
+                lora_alpha = lora_alpha_override if lora_alpha_override is not None else 32
+                scale = lora_alpha / max(r, 1)
+                merged = base_w + (lora_b @ lora_a) * scale
+                out.append((out_key, merged.to(dtype=base_w.dtype, device=base_w.device)))
+                t_merge += time.perf_counter() - t0
+            else:
+                out.append((out_key, base_w))
+        else:
+            out.append((out_key, base_w))
+    return out, t_fetch, t_merge
+
+
+def _normalize_vllm_sync_input_key(key: str, prefix_strip: str = "base_model.model.") -> str:
+    """Normalize HF/PEFT state_dict key to the key-space expected by qwen2_5_vl mapper input."""
+    if prefix_strip and key.startswith(prefix_strip):
+        key = key[len(prefix_strip) :]
+    elif key.startswith("base_model."):
+        key = key[len("base_model.") :]
+
+    # Collapse duplicated language_model/model namespaces emitted by wrappers.
+    if key.startswith("model.language_model.model."):
+        key = "model." + key[len("model.language_model.model.") :]
+    elif key.startswith("model.language_model."):
+        key = "model." + key[len("model.language_model.") :]
+    if key.startswith("language_model.model."):
+        key = "model." + key[len("language_model.model.") :]
+    elif key.startswith("language_model."):
+        key = "model." + key[len("language_model.") :]
+    if key.startswith("model.model."):
+        key = "model." + key[len("model.model.") :]
+
+    # Some wrappers strip "model." from the text tower.
+    text_tower_roots = ("layers.", "embed_tokens.", "norm.", "rotary_emb.")
+    if key.startswith(text_tower_roots):
+        key = "model." + key
+    return key
+
+
+def _summarize_sync_keys(items: list[tuple[str, torch.Tensor]]) -> dict[str, Any]:
+    keys = [k for k, _ in items]
+    counts = {
+        "q_proj": 0,
+        "k_proj": 0,
+        "v_proj": 0,
+        "qkv_proj": 0,
+        "gate_proj": 0,
+        "up_proj": 0,
+        "gate_up_proj": 0,
+    }
+    for k in keys:
+        if "q_proj" in k:
+            counts["q_proj"] += 1
+        if "k_proj" in k:
+            counts["k_proj"] += 1
+        if "v_proj" in k:
+            counts["v_proj"] += 1
+        if "qkv_proj" in k:
+            counts["qkv_proj"] += 1
+        if "gate_proj" in k:
+            counts["gate_proj"] += 1
+        if "up_proj" in k:
+            counts["up_proj"] += 1
+        if "gate_up_proj" in k:
+            counts["gate_up_proj"] += 1
+    return {
+        "total": len(keys),
+        "first_30": keys[:30],
+        "counts": counts,
+    }
+
+
+def _validate_sync_keys(items: list[tuple[str, torch.Tensor]]) -> None:
+    keys = [k for k, _ in items]
+    if len(keys) != len(set(keys)):
+        raise RuntimeError("vLLM sync validation failed: duplicate keys detected.")
+    malformed = [k for k in keys if "." not in k or ("weight" not in k and "bias" not in k)]
+    if malformed:
+        raise RuntimeError(
+            "vLLM sync validation failed: malformed keys detected (sample): "
+            + ", ".join(malformed[:10])
+        )
+
+
+def _estimate_vllm_target_name(sync_key: str) -> str:
+    # qwen2/qwen2.5-vl loader stacks split attention / MLP projections.
+    name = sync_key
+    name = name.replace(".q_proj.", ".qkv_proj.")
+    name = name.replace(".k_proj.", ".qkv_proj.")
+    name = name.replace(".v_proj.", ".qkv_proj.")
+    name = name.replace(".gate_proj.", ".gate_up_proj.")
+    name = name.replace(".up_proj.", ".gate_up_proj.")
+    # qwen2_5_vl hf_to_vllm mapper: model.* -> language_model.model.*
+    if name.startswith("model."):
+        name = "language_model.model." + name[len("model.") :]
+    elif name.startswith("lm_head."):
+        name = "language_model.lm_head." + name[len("lm_head.") :]
+    return name
 
 
 class Qwen2VLGRPOVLLMTrainerModified(Trainer):
@@ -839,6 +1083,20 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
         self.strategy_eval_batch_size = max(1, int(strategy_eval_batch_size))
         self.log_strategy_eval_metrics = bool(log_strategy_eval_metrics)
         self._last_strategy_eval_step = -1
+        # vLLM sync diagnostics are expensive and mostly static after first successful key check.
+        self.vllm_sync_debug_first_n = max(0, int(os.getenv("VLLM_SYNC_DEBUG_FIRST_N", "2")))
+        self.vllm_sync_validate_first_n = max(0, int(os.getenv("VLLM_SYNC_VALIDATE_FIRST_N", "2")))
+        self.vllm_sync_summary_every = max(0, int(os.getenv("VLLM_SYNC_SUMMARY_EVERY", "50")))
+        self._vllm_sync_calls = 0
+        self.vllm_sync_assert_first = os.getenv("VLLM_SYNC_ASSERT_FIRST_SYNC", "true").strip().lower() in {"1", "true", "yes"}
+        self._vllm_sync_assert_done = False
+        self._cached_vllm_model_obj_id: Optional[int] = None
+        self._cached_vllm_param_keys: Optional[set[str]] = None
+        self._vllm_sync_plan: Optional[dict[str, Any]] = None
+        self.timing_debug = os.getenv("GRPO_TIMING_DEBUG", "").strip().lower() in {"1", "true", "yes"}
+        self._timing_prepare: dict[str, float] = {}
+        self._timing_forward_s: float = 0.0
+        self._timing_last_sync_s: float = 0.0
         self._strategies = strategies_for_task(self.reasoning_task_type)
         if self.balanced_strategy_rollout:
             expected_G = len(self._strategies) * self.rollouts_per_strategy
@@ -1085,6 +1343,306 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                 UserWarning,
                 stacklevel=2,
             )
+
+    def _get_cached_llm_param_keys(self, llm_model: Any) -> set[str]:
+        llm_obj_id = id(llm_model)
+        if self._cached_vllm_model_obj_id != llm_obj_id or self._cached_vllm_param_keys is None:
+            self._cached_vllm_model_obj_id = llm_obj_id
+            self._cached_vllm_param_keys = {k for k, _ in llm_model.named_parameters()}
+        return self._cached_vllm_param_keys
+
+    def _build_vllm_sync_plan(
+        self,
+        state_dict: dict[str, torch.Tensor],
+        llm_model: Any,
+        lora_alpha_override: Optional[float],
+        policy_model_obj: Any,
+        context: str,
+    ) -> tuple[dict[str, Any], float]:
+        t0 = time.perf_counter()
+        is_peft_state = any(".base_layer." in k for k in state_dict)
+        if is_peft_state:
+            specs = _build_peft_sync_specs_from_state_dict(state_dict)
+        else:
+            specs = _build_plain_sync_specs_from_state_dict(state_dict)
+
+        # Build once and reuse. This is used for value refresh only.
+        optimized_items, _, _ = _materialize_sync_items_from_specs(
+            state_dict, specs, lora_alpha_override=lora_alpha_override
+        )
+        optimized_final = _filter_vllm_incompatible_weight_keys(optimized_items)
+        _validate_sync_keys(optimized_final)
+
+        # First-sync safety check against previous fullscan-safe path.
+        legacy_final = _build_legacy_sync_items_from_state_dict(
+            state_dict, lora_alpha_override=lora_alpha_override
+        )
+        legacy_keys = [k for k, _ in legacy_final]
+        new_keys = [k for k, _ in optimized_final]
+        if legacy_keys != new_keys:
+            missing_in_new = [k for k in legacy_keys if k not in set(new_keys)]
+            missing_in_legacy = [k for k in new_keys if k not in set(legacy_keys)]
+            logger.error(
+                "[VLLM_SYNC_PLAN][%s] optimized plan mismatch; fallback to legacy fullscan. missing_in_new=%s missing_in_legacy=%s",
+                context,
+                missing_in_new[:20],
+                missing_in_legacy[:20],
+            )
+            plan = {
+                "mode": "legacy_fullscan",
+                "expected_count": len(legacy_keys),
+                "policy_model_obj_id": id(policy_model_obj),
+                "llm_model_obj_id": id(llm_model),
+                "is_peft_state": is_peft_state,
+            }
+            return plan, time.perf_counter() - t0
+
+        llm_param_keys = self._get_cached_llm_param_keys(llm_model)
+        estimated_targets = [_estimate_vllm_target_name(k) for k in new_keys]
+        missing_targets = [k for k in estimated_targets if k not in llm_param_keys]
+        if missing_targets:
+            raise RuntimeError(
+                "[VLLM_SYNC_PLAN] target key mapping mismatch on plan build "
+                f"(context={context}). missing={len(missing_targets)} sample={missing_targets[:20]}"
+            )
+
+        logger.warning(
+            "[VLLM_SYNC_PLAN][%s] built once: mode=optimized specs=%d final=%d first20=%s",
+            context,
+            len(specs),
+            len(new_keys),
+            new_keys[:20],
+        )
+        plan = {
+            "mode": "optimized",
+            "specs": specs,
+            "expected_keys": new_keys,
+            "expected_count": len(new_keys),
+            "policy_model_obj_id": id(policy_model_obj),
+            "llm_model_obj_id": id(llm_model),
+            "is_peft_state": is_peft_state,
+        }
+        return plan, time.perf_counter() - t0
+
+    def _invalidate_vllm_sync_plan(self) -> None:
+        self._vllm_sync_plan = None
+        self._cached_vllm_model_obj_id = None
+        self._cached_vllm_param_keys = None
+
+    def _sync_vllm_weights_with_plan(
+        self,
+        llm_model: Any,
+        state_dict: dict[str, torch.Tensor],
+        lora_alpha_override: Optional[float],
+        policy_model_obj: Any,
+        context: str = "train",
+    ) -> tuple[float, float, float, float, float]:
+        """Sync current weights using cached key plan.
+
+        Returns (total_sync_s, plan_build_s, tensor_fetch_s, peft_merge_s, load_weights_s)
+        """
+        t_sync_start = time.perf_counter()
+        plan_build_s = 0.0
+        tensor_fetch_s = 0.0
+        peft_merge_s = 0.0
+        load_weights_s = 0.0
+
+        need_rebuild = (
+            self._vllm_sync_plan is None
+            or self._vllm_sync_plan.get("policy_model_obj_id") != id(policy_model_obj)
+            or self._vllm_sync_plan.get("llm_model_obj_id") != id(llm_model)
+        )
+        if need_rebuild:
+            self._invalidate_vllm_sync_plan()
+            self._vllm_sync_plan, plan_build_s = self._build_vllm_sync_plan(
+                state_dict=state_dict,
+                llm_model=llm_model,
+                lora_alpha_override=lora_alpha_override,
+                policy_model_obj=policy_model_obj,
+                context=context,
+            )
+
+        plan = self._vllm_sync_plan
+        assert plan is not None
+        if plan.get("mode") == "legacy_fullscan":
+            legacy_final = _build_legacy_sync_items_from_state_dict(
+                state_dict, lora_alpha_override=lora_alpha_override
+            )
+            t0 = time.perf_counter()
+            llm_model.load_weights(legacy_final)
+            load_weights_s = time.perf_counter() - t0
+            self._timing_last_sync_s = time.perf_counter() - t_sync_start
+            return self._timing_last_sync_s, plan_build_s, tensor_fetch_s, peft_merge_s, load_weights_s
+
+        items, tensor_fetch_s, peft_merge_s = _materialize_sync_items_from_specs(
+            state_dict=state_dict,
+            specs=plan["specs"],
+            lora_alpha_override=lora_alpha_override,
+        )
+        # Guard against shape/key drift; rebuild once if changed.
+        if len(items) != int(plan["expected_count"]):
+            self._invalidate_vllm_sync_plan()
+            self._vllm_sync_plan, rebuilt_s = self._build_vllm_sync_plan(
+                state_dict=state_dict,
+                llm_model=llm_model,
+                lora_alpha_override=lora_alpha_override,
+                policy_model_obj=policy_model_obj,
+                context=context,
+            )
+            plan_build_s += rebuilt_s
+            plan = self._vllm_sync_plan
+            if plan is None:
+                raise RuntimeError("[VLLM_SYNC_PLAN] plan rebuild failed unexpectedly.")
+            if plan.get("mode") == "legacy_fullscan":
+                legacy_final = _build_legacy_sync_items_from_state_dict(
+                    state_dict, lora_alpha_override=lora_alpha_override
+                )
+                t0 = time.perf_counter()
+                llm_model.load_weights(legacy_final)
+                load_weights_s = time.perf_counter() - t0
+                self._timing_last_sync_s = time.perf_counter() - t_sync_start
+                return self._timing_last_sync_s, plan_build_s, tensor_fetch_s, peft_merge_s, load_weights_s
+            items, tensor_fetch_s, peft_merge_s = _materialize_sync_items_from_specs(
+                state_dict=state_dict,
+                specs=plan["specs"],
+                lora_alpha_override=lora_alpha_override,
+            )
+
+        # Keep logging behavior consistent with current sync logger.
+        self._try_sync_vllm_weights(
+            llm_model,
+            items,
+            context=context,
+            legacy_remapped_items=None,
+            already_filtered=True,
+        )
+        # _try_sync_vllm_weights already calls load_weights; measure load-only approximately by direct call avoided.
+        # Keep per-phase timers still useful: tensor_fetch/merge/plan_build from above.
+        load_weights_s = max(0.0, self._timing_last_sync_s - tensor_fetch_s - peft_merge_s)
+        return self._timing_last_sync_s, plan_build_s, tensor_fetch_s, peft_merge_s, load_weights_s
+
+    def _try_sync_vllm_weights(
+        self,
+        llm_model: Any,
+        remapped_items: list[tuple[str, torch.Tensor]],
+        context: str = "train",
+        legacy_remapped_items: Optional[list[tuple[str, torch.Tensor]]] = None,
+        already_filtered: bool = False,
+    ) -> float:
+        t0 = time.perf_counter()
+        sync_idx = self._vllm_sync_calls
+        self._vllm_sync_calls += 1
+        should_debug = sync_idx < self.vllm_sync_debug_first_n
+        should_validate_targets = sync_idx < self.vllm_sync_validate_first_n
+        should_summary = (
+            self.vllm_sync_summary_every > 0
+            and sync_idx >= self.vllm_sync_debug_first_n
+            and sync_idx % self.vllm_sync_summary_every == 0
+        )
+        incoming = list(remapped_items)
+        filtered = incoming if already_filtered else _filter_vllm_incompatible_weight_keys(incoming)
+        _validate_sync_keys(filtered)
+        if (
+            self.vllm_sync_assert_first
+            and not self._vllm_sync_assert_done
+            and sync_idx == 0
+            and legacy_remapped_items is not None
+        ):
+            legacy_filtered = _filter_vllm_incompatible_weight_keys(legacy_remapped_items)
+            legacy_keys = [k for k, _ in legacy_filtered]
+            new_keys = [k for k, _ in filtered]
+            if len(legacy_keys) != len(new_keys) or legacy_keys != new_keys:
+                missing_in_new = [k for k in legacy_keys if k not in set(new_keys)]
+                missing_in_legacy = [k for k in new_keys if k not in set(legacy_keys)]
+                raise RuntimeError(
+                    "[VLLM_SYNC_ASSERT] first-sync key mismatch between legacy filter path and "
+                    f"optimized direct-selection path. legacy={len(legacy_keys)} new={len(new_keys)} "
+                    f"missing_in_new_sample={missing_in_new[:20]} missing_in_legacy_sample={missing_in_legacy[:20]}"
+                )
+            self._vllm_sync_assert_done = True
+
+        in_summary = None
+        out_summary = None
+        if should_debug or should_summary:
+            in_summary = _summarize_sync_keys(incoming)
+            out_summary = _summarize_sync_keys(filtered)
+        if should_debug:
+            logger.warning(
+                "[VLLM_SYNC][%s] sync_idx=%d incoming_total=%d incoming_counts=%s incoming_first30=%s",
+                context,
+                sync_idx,
+                in_summary["total"],
+                in_summary["counts"],
+                in_summary["first_30"],
+            )
+            logger.warning(
+                "[VLLM_SYNC][%s] sync_idx=%d filtered_total=%d filtered_counts=%s filtered_first30=%s",
+                context,
+                sync_idx,
+                out_summary["total"],
+                out_summary["counts"],
+                out_summary["first_30"],
+            )
+            logger.warning(
+                "[VLLM_SYNC][%s] sync_idx=%d fused_qkv_groups=%d fused_gate_up_groups=%d final_items=%d",
+                context,
+                sync_idx,
+                0,
+                0,
+                out_summary["total"],
+            )
+        elif should_summary:
+            logger.info(
+                "[VLLM_SYNC][%s] sync_idx=%d incoming_total=%d filtered_total=%d counts=%s",
+                context,
+                sync_idx,
+                in_summary["total"],
+                out_summary["total"],
+                out_summary["counts"],
+            )
+        if should_validate_targets:
+            llm_param_keys = self._get_cached_llm_param_keys(llm_model)
+            estimated_targets = [_estimate_vllm_target_name(k) for k, _ in filtered]
+            missing_targets = [k for k in estimated_targets if k not in llm_param_keys]
+            if missing_targets:
+                if in_summary is None or out_summary is None:
+                    in_summary = _summarize_sync_keys(incoming)
+                    out_summary = _summarize_sync_keys(filtered)
+                    logger.warning(
+                        "[VLLM_SYNC][%s] sync_idx=%d incoming_total=%d incoming_counts=%s incoming_first30=%s",
+                        context,
+                        sync_idx,
+                        in_summary["total"],
+                        in_summary["counts"],
+                        in_summary["first_30"],
+                    )
+                    logger.warning(
+                        "[VLLM_SYNC][%s] sync_idx=%d filtered_total=%d filtered_counts=%s filtered_first30=%s",
+                        context,
+                        sync_idx,
+                        out_summary["total"],
+                        out_summary["counts"],
+                        out_summary["first_30"],
+                    )
+                raise RuntimeError(
+                    "[VLLM_SYNC] target key mapping mismatch before load_weights "
+                    f"(context={context}, sync_idx={sync_idx}). "
+                    f"missing={len(missing_targets)} sample={missing_targets[:20]}"
+                )
+        try:
+            llm_model.load_weights(filtered)
+        except Exception as exc:
+            if in_summary is None or out_summary is None:
+                in_summary = {"total": len(incoming), "counts": "suppressed"}
+                out_summary = {"total": len(filtered), "counts": "suppressed"}
+            raise RuntimeError(
+                "[VLLM_SYNC] load_weights failed "
+                f"(context={context}, sync_idx={sync_idx}, incoming={in_summary['total']}, filtered={out_summary['total']}, "
+                f"counts={out_summary['counts']})"
+            ) from exc
+        elapsed = time.perf_counter() - t0
+        self._timing_last_sync_s = elapsed
+        return elapsed
 
     def _make_placeholder_pil(self) -> Image.Image:
         """RGB image that always passes Qwen-VL smart_resize after spatial / aspect helpers."""
@@ -1619,6 +2177,17 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
     def _prepare_inputs(
         self, inputs: dict[str, Union[torch.Tensor, Any]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
+        t_prepare_start = time.perf_counter()
+        t_data_loading = 0.0
+        t_processor = 0.0
+        t_sync = 0.0
+        t_sync_plan_build = 0.0
+        t_sync_tensor_fetch = 0.0
+        t_sync_peft_merge = 0.0
+        t_sync_load_weights = 0.0
+        t_generation = 0.0
+        t_reward = 0.0
+        t_periodic_eval = 0.0
         device = self.accelerator.device
 
         # Balanced strategy rollout: expand B inputs into B*G prompt-major slots, each with a
@@ -1647,6 +2216,7 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
         prompts = [x["prompt"] for x in effective_inputs]
         # Build reduced-frame examples first so chat template placeholder count
         # matches the actual number of frames passed to the processor.
+        t0 = time.perf_counter()
         normalized_examples = []
         images = []
         for example in effective_inputs:
@@ -1677,12 +2247,15 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                 ]
             normalized_examples.append(ex)
             images.append(reduced)
+        t_data_loading += time.perf_counter() - t0
+        t0 = time.perf_counter()
         prompts_text = [
             maybe_apply_chat_template(example, self.processing_class)["prompt"]
             for example in normalized_examples
         ]
         # print(f"prompts_text: {prompts_text}")
         prompt_inputs = self._safe_multimodal_processor_inputs(prompts_text, images)
+        t_processor += time.perf_counter() - t0
         prompt_ids, prompt_mask = prompt_inputs["input_ids"].to(device), prompt_inputs["attention_mask"].to(device)
         
         if self.max_prompt_length is not None:
@@ -1704,26 +2277,32 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                     llm_model = (
                         self.llm.llm_engine.model_executor.driver_worker.model_runner.model
                     )
-                    # PEFT state_dict has base_layer/lora_A/lora_B; vLLM needs merged plain keys.
-                    if any(".base_layer." in k for k in state_dict):
-                        lora_alpha = _get_lora_alpha_from_model(unwrapped_model)
-                        remapped_items = _peft_state_dict_to_merged_state_dict(
-                            state_dict, lora_alpha_override=lora_alpha
-                        )
-                    else:
-                        remapped_items = []
-                        for key, value in state_dict.items():
-                            if key.startswith("base_model.model."):
-                                key = key[len("base_model.model.") :]
-                            elif key.startswith("base_model."):
-                                key = key[len("base_model.") :]
-                            remapped_items.append((key, value))
-                    llm_model.load_weights(
-                        _filter_vllm_incompatible_weight_keys(remapped_items)
+                    policy_model_obj = (
+                        unwrapped_model._orig_mod if is_compiled_module(unwrapped_model) else unwrapped_model
                     )
+                    lora_alpha = _get_lora_alpha_from_model(unwrapped_model)
+                    (
+                        sync_total_s,
+                        sync_plan_build_s,
+                        sync_tensor_fetch_s,
+                        sync_peft_merge_s,
+                        sync_load_weights_s,
+                    ) = self._sync_vllm_weights_with_plan(
+                        llm_model=llm_model,
+                        state_dict=state_dict,
+                        lora_alpha_override=lora_alpha,
+                        policy_model_obj=policy_model_obj,
+                        context="train",
+                    )
+                    t_sync += sync_total_s
+                    t_sync_plan_build += sync_plan_build_s
+                    t_sync_tensor_fetch += sync_tensor_fetch_s
+                    t_sync_peft_merge += sync_peft_merge_s
+                    t_sync_load_weights += sync_load_weights_s
                 self._last_loaded_step = self.state.global_step
 
             # Generate completions using vLLM: gather all prompts and use them in a single call in the main process
+            t0 = time.perf_counter()
             all_prompts_text = gather_object(prompts_text)
             all_images = gather_object(images)
             # group into pairs
@@ -1792,6 +2371,7 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                 (self.accelerator.process_index + 1) * len(prompts) * _sampling_n,
             )
             completion_ids = completion_ids[process_slice]
+            t_generation += time.perf_counter() - t0
 
             # Pad the completions, and concatenate them with the prompts
             completion_ids = [torch.tensor(ids, device=device) for ids in completion_ids]
@@ -1888,6 +2468,7 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
             all_solutions_for_metrics = []
 
         # Compute the rewards
+        t0 = time.perf_counter()
         prompts = [prompt for prompt in prompts for _ in range(_sampling_n)]
         rewards_per_func = torch.zeros(
             len(prompts), len(self.reward_funcs), device=device
@@ -2009,7 +2590,23 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                 completions=completions,
                 strategy_log=_strategy_log,
             )
+        t_reward += time.perf_counter() - t0
+        t0 = time.perf_counter()
         self._run_periodic_strategy_eval()
+        t_periodic_eval += time.perf_counter() - t0
+        self._timing_prepare = {
+            "data_loading": t_data_loading,
+            "processor": t_processor,
+            "sync": t_sync,
+            "sync_plan_build": t_sync_plan_build,
+            "sync_tensor_fetch": t_sync_tensor_fetch,
+            "sync_peft_merge": t_sync_peft_merge,
+            "sync_load_weights": t_sync_load_weights,
+            "generation": t_generation,
+            "reward": t_reward,
+            "periodic_eval": t_periodic_eval,
+            "prepare_total": time.perf_counter() - t_prepare_start,
+        }
 
         return {
             "prompt_ids": prompt_ids,
@@ -2025,6 +2622,7 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
     def compute_loss(
         self, model, inputs, return_outputs=False, num_items_in_batch=None
     ):
+        t0 = time.perf_counter()
         if return_outputs:
             raise ValueError("The GRPOTrainer does not support returning outputs")
         # Compute the per-token log probabilities for the model
@@ -2088,6 +2686,38 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
             self.accelerator.gather_for_metrics(mean_kl).mean().item()
         )
 
+        self._timing_forward_s = time.perf_counter() - t0
+        return loss
+
+    def training_step(
+        self, model: nn.Module, inputs: dict[str, Union[torch.Tensor, Any]], num_items_in_batch=None
+    ):
+        t0 = time.perf_counter()
+        loss = super().training_step(model, inputs, num_items_in_batch=num_items_in_batch)
+        total_s = time.perf_counter() - t0
+        if self.timing_debug and self.accelerator.is_main_process:
+            prep = self._timing_prepare or {}
+            prep_total = float(prep.get("prepare_total", 0.0))
+            forward_s = float(getattr(self, "_timing_forward_s", 0.0))
+            backward_s = max(0.0, total_s - prep_total - forward_s)
+            logger.info(
+                "[TIMING][step=%d] data_loading=%.3fs processor=%.3fs sync=%.3fs sync_plan_build=%.3fs tensor_fetch=%.3fs peft_merge=%.3fs load_weights=%.3fs generation=%.3fs reward=%.3fs eval=%.3fs prepare=%.3fs forward=%.3fs backward=%.3fs total=%.3fs",
+                int(self.state.global_step),
+                float(prep.get("data_loading", 0.0)),
+                float(prep.get("processor", 0.0)),
+                float(prep.get("sync", 0.0)),
+                float(prep.get("sync_plan_build", 0.0)),
+                float(prep.get("sync_tensor_fetch", 0.0)),
+                float(prep.get("sync_peft_merge", 0.0)),
+                float(prep.get("sync_load_weights", 0.0)),
+                float(prep.get("generation", 0.0)),
+                float(prep.get("reward", 0.0)),
+                float(prep.get("periodic_eval", 0.0)),
+                prep_total,
+                forward_s,
+                backward_s,
+                total_s,
+            )
         return loss
 
     def run_test_inference(
@@ -2118,23 +2748,20 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                     state_dict = unwrapped_model._orig_mod.state_dict()
                 else:
                     state_dict = unwrapped_model.state_dict()
-            lora_alpha = _get_lora_alpha_from_model(self.model)
-            if any(".base_layer." in k for k in state_dict):
-                remapped_items = _peft_state_dict_to_merged_state_dict(
-                    state_dict, lora_alpha_override=lora_alpha
-                )
-            else:
-                remapped_items = []
-                for key, value in state_dict.items():
-                    if key.startswith("base_model.model."):
-                        key = key[len("base_model.model.") :]
-                    elif key.startswith("base_model."):
-                        key = key[len("base_model.") :]
-                    remapped_items.append((key, value))
+            lora_alpha = _get_lora_alpha_from_model(unwrapped_model)
             llm_model = (
                 self.llm.llm_engine.model_executor.driver_worker.model_runner.model
             )
-            llm_model.load_weights(_filter_vllm_incompatible_weight_keys(remapped_items))
+            policy_model_obj = (
+                unwrapped_model._orig_mod if is_compiled_module(unwrapped_model) else unwrapped_model
+            )
+            self._sync_vllm_weights_with_plan(
+                llm_model=llm_model,
+                state_dict=state_dict,
+                lora_alpha_override=lora_alpha,
+                policy_model_obj=policy_model_obj,
+                context="eval",
+            )
             self._last_loaded_step = self.state.global_step
 
         sampling_params = copy.deepcopy(self.sampling_params)

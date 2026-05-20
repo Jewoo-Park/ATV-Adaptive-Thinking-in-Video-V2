@@ -265,7 +265,7 @@ LORA_ARGS=(
   --lora_r "${LORA_R}"
   --lora_alpha "${LORA_ALPHA}"
   --lora_dropout "${LORA_DROPOUT}"
-  --lora_target_modules q_proj k_proj v_proj o_proj
+  --lora_target_modules q_proj k_proj v_proj o_proj gate_proj up_proj down_proj
 )
 
 STRATEGY_ARGS=(
