@@ -832,11 +832,28 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
         # Trained model
         model_init_kwargs = args.model_init_kwargs or {}
         model_init_kwargs["attn_implementation"] = attn_implementation
+        loaded_from_adapter_checkpoint = False
         if isinstance(model, str):
             model_id = model
+            base_model_id_from_adapter = None
+            if is_peft_available():
+                try:
+                    adapter_cfg = PeftConfig.from_pretrained(model_id)
+                    base_model_id_from_adapter = getattr(
+                        adapter_cfg, "base_model_name_or_path", None
+                    )
+                except Exception:
+                    base_model_id_from_adapter = None
+            load_model_id = base_model_id_from_adapter or model_id
+            if base_model_id_from_adapter:
+                logger.info(
+                    "Detected PEFT adapter checkpoint at %s; loading base model from %s and then applying adapter.",
+                    model_id,
+                    base_model_id_from_adapter,
+                )
             model_type = None
             try:
-                model_type = AutoConfig.from_pretrained(model_id).model_type
+                model_type = AutoConfig.from_pretrained(load_model_id).model_type
             except Exception:
                 # Fall back to path/name heuristics if config probing fails.
                 model_type = None
@@ -861,23 +878,31 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                 if args.gradient_checkpointing
                 else model_init_kwargs.get("use_cache")
             )
-            if model_type == "qwen2_vl" or "Qwen2-VL" in model_id:
+            if model_type == "qwen2_vl" or "Qwen2-VL" in load_model_id:
                 model = Qwen2VLForConditionalGeneration.from_pretrained(
-                    model, **model_init_kwargs
+                    load_model_id, **model_init_kwargs
                 )
-            elif model_type == "qwen2_5_vl" or "Qwen2.5-VL" in model_id:
+            elif model_type == "qwen2_5_vl" or "Qwen2.5-VL" in load_model_id:
                 model_init_kwargs.pop("use_cache", None)
-                cfg = _coerce_qwen25_text_config(AutoConfig.from_pretrained(model_id))
+                cfg = _coerce_qwen25_text_config(AutoConfig.from_pretrained(load_model_id))
                 model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                    model, config=cfg, **model_init_kwargs
+                    load_model_id, config=cfg, **model_init_kwargs
                 )
-            elif "Aria" in model_id:
+            elif "Aria" in load_model_id:
                 model_init_kwargs.pop("use_cache")
                 model = AriaForConditionalGeneration.from_pretrained(
-                    model, **model_init_kwargs
+                    load_model_id, **model_init_kwargs
                 )
             else:
-                model = AutoModelForCausalLM.from_pretrained(model, **model_init_kwargs)
+                model = AutoModelForCausalLM.from_pretrained(load_model_id, **model_init_kwargs)
+            if base_model_id_from_adapter:
+                model = PeftModel.from_pretrained(
+                    model,
+                    model_id,
+                    is_trainable=True,
+                )
+                loaded_from_adapter_checkpoint = True
+                model_id = load_model_id
         else:
             model_id = model.config._name_or_path
             if args.model_init_kwargs is not None:
@@ -886,7 +911,7 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                     "This argument can only be used when the `model` argument is a string."
                 )
 
-        if peft_config is not None:
+        if peft_config is not None and not loaded_from_adapter_checkpoint:
             model = get_peft_model(model, peft_config)
 
         # Reference model
@@ -1862,6 +1887,67 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
         log_probs = logits_i[0].log_softmax(dim=-1)
         return torch.gather(log_probs, dim=1, index=ids_i[0].unsqueeze(1)).squeeze(1)
 
+    @staticmethod
+    def _is_mm_token_feature_mismatch_error(exc: Exception) -> bool:
+        msg = str(exc)
+        return (
+            "Image features and image tokens do not match" in msg
+            or ("tokens:" in msg and "features" in msg and "image" in msg.lower())
+        )
+
+    @staticmethod
+    def _is_deepspeed_timer_assertion_error(exc: Exception) -> bool:
+        return isinstance(exc, AssertionError) and "timer has already been started" in str(exc)
+
+    @staticmethod
+    def _reset_deepspeed_fwd_microstep_timer(model) -> None:
+        """Clear a stuck DeepSpeed fwd_microstep timer after checkpoint/recompute overlap."""
+        if not hasattr(model, "timers"):
+            return
+        try:
+            from deepspeed.utils.timer import FORWARD_MICRO_TIMER
+        except ImportError:
+            return
+        timer = model.timers(FORWARD_MICRO_TIMER)
+        if getattr(timer, "started_", False):
+            try:
+                timer.stop(reset=True)
+            except AssertionError:
+                timer.reset()
+        else:
+            timer.reset()
+
+    def _forward_row_logprobs_maybe_checkpointed(
+        self,
+        model,
+        input_ids_1: torch.Tensor,
+        attention_mask_1: torch.Tensor,
+        pixel_values_single: torch.Tensor,
+        image_grid_thw_single: torch.Tensor,
+        logits_to_keep: int,
+        *,
+        use_row_ckpt: bool,
+    ) -> torch.Tensor:
+        if use_row_ckpt:
+            return checkpoint(
+                lambda a, b, pv, thw: self._forward_one_row_logprobs(
+                    model, a, b, pv, thw, logits_to_keep
+                ),
+                input_ids_1,
+                attention_mask_1,
+                pixel_values_single,
+                image_grid_thw_single,
+                use_reentrant=False,
+            )
+        return self._forward_one_row_logprobs(
+            model,
+            input_ids_1,
+            attention_mask_1,
+            pixel_values_single,
+            image_grid_thw_single,
+            logits_to_keep,
+        )
+
     # Get the per-token log probabilities for the completions for the model and the reference model
     def _get_per_token_logps(
         self,
@@ -1881,35 +1967,66 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
 
         # Stacking B separate forwards in one autograd graph retains all activations at once and OOMs on 7B VL + long
         # context. Checkpoint each row so only one forward's activations live at a time (recompute on backward).
-        use_row_ckpt = (
-            os.getenv("GRPO_ROW_ACTIVATION_CHECKPOINT", "true").strip().lower()
-            == "true"
-        )
+        # Activation checkpointing is only useful when gradients are enabled.
+        # In no_grad/inference paths (e.g. ref_per_token_logps), forcing checkpoint
+        # only adds Python/runtime overhead without memory benefit.
+        # DeepSpeed + per-row torch.checkpoint can rarely trip fwd_microstep timers (AssertionError).
+        # Never disable row checkpoint for VRAM (9 rows without ckpt OOMs); reset the stuck timer and retry.
+        row_ckpt_env = os.getenv("GRPO_ROW_ACTIVATION_CHECKPOINT", "true").strip().lower() == "true"
+        use_row_ckpt = row_ckpt_env and torch.is_grad_enabled()
         per_token_logps = []
         for i in range(B):
             ids_1 = input_ids[i : i + 1]
             mask_1 = attention_mask[i : i + 1]
-            if use_row_ckpt:
-                # Only tensor args to checkpoint(); logits_to_keep is an int (closure).
-                row = checkpoint(
-                    lambda a, b, pv, thw: self._forward_one_row_logprobs(
-                        model, a, b, pv, thw, logits_to_keep
-                    ),
-                    ids_1,
-                    mask_1,
-                    pv_single,
-                    thw_single,
-                    use_reentrant=False,
-                )
-            else:
-                row = self._forward_one_row_logprobs(
+            try:
+                row = self._forward_row_logprobs_maybe_checkpointed(
                     model,
                     ids_1,
                     mask_1,
                     pv_single,
                     thw_single,
                     logits_to_keep,
+                    use_row_ckpt=use_row_ckpt,
                 )
+            except (ValueError, AssertionError) as exc:
+                skip_mm_row = (
+                    os.getenv("GRPO_SKIP_MM_TOKEN_FEATURE_MISMATCH_ROW", "true")
+                    .strip()
+                    .lower()
+                    in ("1", "true", "yes")
+                )
+                if skip_mm_row and self._is_mm_token_feature_mismatch_error(exc):
+                    skip_count = int(getattr(self, "_mm_row_skip_count", 0)) + 1
+                    self._mm_row_skip_count = skip_count
+                    self._log_image_fallback(
+                        "[MM_MISMATCH_SKIP] "
+                        f"step={self.state.global_step} row={i}/{B} "
+                        f"logits_to_keep={logits_to_keep} total_skipped={skip_count} "
+                        f"error={exc}"
+                    )
+                    row = torch.zeros(
+                        (logits_to_keep,),
+                        device=ids_1.device,
+                        dtype=torch.float32,
+                    )
+                elif use_row_ckpt and self._is_deepspeed_timer_assertion_error(exc):
+                    self._reset_deepspeed_fwd_microstep_timer(model)
+                    self._log_image_fallback(
+                        "[DS_TIMER_RETRY] "
+                        f"step={self.state.global_step} row={i}/{B} "
+                        f"reset fwd_microstep timer and retry with row checkpoint: {exc}"
+                    )
+                    row = self._forward_row_logprobs_maybe_checkpointed(
+                        model,
+                        ids_1,
+                        mask_1,
+                        pv_single,
+                        thw_single,
+                        logits_to_keep,
+                        use_row_ckpt=True,
+                    )
+                else:
+                    raise
             per_token_logps.append(row)
         return torch.stack(per_token_logps)
 

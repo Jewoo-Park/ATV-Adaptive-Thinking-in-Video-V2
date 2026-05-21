@@ -1,8 +1,9 @@
+import glob
 import json
 import os
 import re
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import datetime
 from typing import Optional
 
@@ -322,6 +323,176 @@ def system_prompt_for_task(task_type: str) -> str:
     raise ValueError("reasoning_task_type must be either 'length' or 'perspective'")
 
 
+def _checkpoint_has_deepspeed_state(checkpoint_dir: str) -> bool:
+    return bool(glob.glob(os.path.join(checkpoint_dir, "global_step*")))
+
+
+def _checkpoint_has_peft_adapter(checkpoint_dir: str) -> bool:
+    return os.path.isfile(os.path.join(checkpoint_dir, "adapter_model.safetensors")) or os.path.isfile(
+        os.path.join(checkpoint_dir, "adapter_model.bin")
+    )
+
+
+def _sanitize_trainer_state_json_for_resume(checkpoint_dir: str) -> None:
+    """Drop TrainerState keys that the installed transformers version does not accept."""
+    from transformers.trainer import TrainerState
+
+    path = os.path.join(checkpoint_dir, "trainer_state.json")
+    if not os.path.isfile(path):
+        return
+    allowed = {f.name for f in fields(TrainerState)}
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    extra = [k for k in list(data.keys()) if k not in allowed]
+    if not extra:
+        return
+    for k in extra:
+        del data[k]
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    print(f"[VIDEO-GRPO] sanitized trainer_state.json (removed keys: {extra})")
+
+
+def _read_checkpoint_global_step(checkpoint_dir: str) -> int:
+    path = os.path.join(checkpoint_dir, "trainer_state.json")
+    if not os.path.isfile(path):
+        return 0
+    with open(path, "r", encoding="utf-8") as f:
+        return int(json.load(f).get("global_step", 0))
+
+
+def _validate_resume_checkpoint(
+    resume_ckpt: str,
+    model_name_or_path: str,
+    max_steps: int,
+) -> int:
+    if not _checkpoint_has_peft_adapter(resume_ckpt):
+        raise FileNotFoundError(
+            f"resume checkpoint is missing PEFT adapter weights under {resume_ckpt} "
+            "(expected adapter_model.safetensors or adapter_model.bin)."
+        )
+    from peft import PeftConfig
+
+    cfg = PeftConfig.from_pretrained(resume_ckpt)
+    base = os.path.abspath(os.path.expanduser(str(cfg.base_model_name_or_path)))
+    model_path = os.path.abspath(os.path.expanduser(str(model_name_or_path)))
+    if base != model_path:
+        raise ValueError(
+            "Resume checkpoint base_model_name_or_path does not match training model path. "
+            f"checkpoint base={base} vs model_name_or_path={model_path}. "
+            "Keep QWEN_PATH as the merged SFT model; only set RESUME_FROM_CHECKPOINT to the GRPO adapter dir."
+        )
+    global_step = _read_checkpoint_global_step(resume_ckpt)
+    if max_steps > 0 and global_step >= max_steps:
+        raise ValueError(
+            f"checkpoint global_step={global_step} is already >= max_steps={max_steps}; nothing left to train."
+        )
+    return global_step
+
+
+def _checkpoint_has_optimizer_or_scheduler_state(checkpoint_dir: str) -> bool:
+    names = (
+        "scheduler.pt",
+        "optimizer.pt",
+        "optimizer.bin",
+        "rng_state.pth",
+    )
+    if any(os.path.isfile(os.path.join(checkpoint_dir, n)) for n in names):
+        return True
+    return any(
+        "optimizer" in entry or "scheduler" in entry or "rng_state" in entry
+        for entry in os.listdir(checkpoint_dir)
+    )
+
+
+def _train_with_resume(trainer, resume_ckpt: Optional[str]) -> None:
+    """
+    DeepSpeed + save_only_model saves PEFT adapters without global_step* dirs.
+    Transformers then fails in deepspeed_load_checkpoint; load adapters first and skip DS reload.
+    save_only_model also omits optimizer/scheduler files, but Trainer still calls torch.load checks.
+    LENGTH and PERSPECTIVE share this path via open_r1.grpo.main().
+    """
+    if not resume_ckpt:
+        trainer.train()
+        return
+
+    peft_only = _checkpoint_has_peft_adapter(resume_ckpt) and not _checkpoint_has_deepspeed_state(resume_ckpt)
+    if not peft_only:
+        trainer.train(resume_from_checkpoint=resume_ckpt)
+        return
+
+    if trainer.is_world_process_zero():
+        _sanitize_trainer_state_json_for_resume(resume_ckpt)
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        torch.distributed.barrier()
+
+    if trainer.is_world_process_zero():
+        print(
+            f"[VIDEO-GRPO] Resuming from PEFT adapter checkpoint (no DeepSpeed global_step*): {resume_ckpt}"
+        )
+
+    if getattr(trainer, "is_deepspeed_enabled", False):
+        trainer._load_from_checkpoint(resume_ckpt)
+
+        import transformers.integrations.deepspeed as ds_integration
+        import transformers.trainer as hf_trainer
+
+        _orig_ds_load = ds_integration.deepspeed_load_checkpoint
+        _orig_load_opt_sched = trainer._load_optimizer_and_scheduler
+
+        def _deepspeed_load_checkpoint_peft_only(engine, checkpoint_path, load_module_strict=True):
+            if _checkpoint_has_deepspeed_state(checkpoint_path):
+                return _orig_ds_load(engine, checkpoint_path, load_module_strict=load_module_strict)
+            if trainer.is_world_process_zero():
+                print(
+                    f"[VIDEO-GRPO] Skipping DeepSpeed checkpoint reload (PEFT adapter already loaded): "
+                    f"{checkpoint_path}"
+                )
+            return None, None
+
+        def _load_optimizer_and_scheduler_peft_only(checkpoint):
+            if checkpoint is None:
+                return
+            if not _checkpoint_has_optimizer_or_scheduler_state(checkpoint):
+                if trainer.is_world_process_zero():
+                    print(
+                        "[VIDEO-GRPO] No optimizer/scheduler in checkpoint; using fresh optimizer "
+                        "(trainer_state.json still restores global_step)."
+                    )
+                return
+            return _orig_load_opt_sched(checkpoint)
+
+        ds_integration.deepspeed_load_checkpoint = _deepspeed_load_checkpoint_peft_only
+        hf_trainer.deepspeed_load_checkpoint = _deepspeed_load_checkpoint_peft_only
+        trainer._load_optimizer_and_scheduler = _load_optimizer_and_scheduler_peft_only
+        try:
+            trainer.train(resume_from_checkpoint=resume_ckpt)
+        finally:
+            ds_integration.deepspeed_load_checkpoint = _orig_ds_load
+            hf_trainer.deepspeed_load_checkpoint = _orig_ds_load
+            trainer._load_optimizer_and_scheduler = _orig_load_opt_sched
+    else:
+        trainer.train(resume_from_checkpoint=resume_ckpt)
+
+
+def _prepare_resume_checkpoint(
+    resume_ckpt: Optional[str],
+    model_name_or_path: str,
+    max_steps: int,
+) -> Optional[str]:
+    if not resume_ckpt:
+        return None
+    resume_ckpt = os.path.abspath(os.path.expanduser(str(resume_ckpt)))
+    if not os.path.isdir(resume_ckpt):
+        raise FileNotFoundError(f"resume_from_checkpoint is not a directory: {resume_ckpt}")
+    global_step = _validate_resume_checkpoint(resume_ckpt, model_name_or_path, max_steps)
+    print(
+        f"[VIDEO-GRPO] Resume checkpoint OK: path={resume_ckpt} global_step={global_step} "
+        f"max_steps={max_steps}"
+    )
+    return resume_ckpt
+
+
 def main(script_args, training_args, model_args):
     # Suppress repeated FA2 dtype warnings emitted by transformers internals on each rank.
     warnings.filterwarnings(
@@ -486,13 +657,13 @@ def main(script_args, training_args, model_args):
     trainer = trainer_cls(**trainer_kwargs)
 
     # GRPOConfig inherits TrainingArguments, which already defines --resume_from_checkpoint (do not duplicate on ScriptArguments).
-    resume_ckpt = getattr(training_args, "resume_from_checkpoint", None)
-    if resume_ckpt:
-        resume_ckpt = os.path.abspath(os.path.expanduser(str(resume_ckpt)))
-        if not os.path.isdir(resume_ckpt):
-            raise FileNotFoundError(f"resume_from_checkpoint is not a directory: {resume_ckpt}")
+    resume_ckpt = _prepare_resume_checkpoint(
+        getattr(training_args, "resume_from_checkpoint", None),
+        model_args.model_name_or_path,
+        int(training_args.max_steps) if training_args.max_steps and training_args.max_steps > 0 else 0,
+    )
 
-    trainer.train(resume_from_checkpoint=resume_ckpt)
+    _train_with_resume(trainer, resume_ckpt)
     trainer.save_model(training_args.output_dir)
 
     if script_args.test_file and "test" in dataset:
