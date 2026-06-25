@@ -138,6 +138,7 @@ SUPPORTED_SFT_MODES = {"length", "perspective"}
 FORMAT_INSTRUCTIONS = {
     "answer": (
         "Use the direct-answer format exactly:\n"
+        "<DIRECT>None</DIRECT>\n"
         "<ANSWER>X</ANSWER>\n"
         "X must be a single option letter from A to J. Do not put explanations or option text inside <ANSWER>."
     ),
@@ -308,13 +309,17 @@ def build_targets_for_sample(
 
     answer_block = extract_tag_block(output_text, "ANSWER")
     answer_block = compact_answer_block(answer_block)
+    direct_block = extract_tag_block(output_text, "DIRECT")
     cot_block = extract_tag_block(output_text, "COT")
     long_cot_block = extract_tag_block(output_text, "LONG_COT")
 
     candidates: List[Tuple[str, str]] = []
     for fmt in enabled_formats:
         if fmt == "answer" and answer_block:
-            candidates.append(("answer", answer_block))
+            if direct_block:
+                candidates.append(("answer", f"{direct_block}\n{answer_block}"))
+            else:
+                candidates.append(("answer", f"<DIRECT>None</DIRECT>\n{answer_block}"))
         elif fmt == "cot" and cot_block and answer_block:
             candidates.append(("cot", f"{cot_block}\n{answer_block}"))
         elif fmt == "long_cot" and long_cot_block and answer_block:

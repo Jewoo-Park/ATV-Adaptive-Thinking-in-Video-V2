@@ -68,7 +68,7 @@ def _check_media_paths(row: dict, base_dir: Path, errors: list[str], line_no: in
             errors.append(f"L{line_no}: `{key}` path does not exist: {val}")
 
 
-def validate_jsonl(path: Path, mode: str) -> tuple[int, list[str]]:
+def validate_jsonl(path: Path, mode: str, *, skip_media_check: bool = False) -> tuple[int, list[str]]:
     errors: list[str] = []
     total = 0
     base_dir = path.resolve().parent
@@ -125,7 +125,8 @@ def validate_jsonl(path: Path, mode: str) -> tuple[int, list[str]]:
                         f"L{i}: length mode but task marker is `{task_type}` (expected length)"
                     )
 
-            _check_media_paths(row, base_dir, errors, i)
+            if not skip_media_check:
+                _check_media_paths(row, base_dir, errors, i)
 
     if total == 0:
         errors.append("no non-empty JSONL rows found")
@@ -141,6 +142,11 @@ def main() -> None:
         choices=("length", "perspective"),
         help="Target reasoning mode for this dataset",
     )
+    ap.add_argument(
+        "--skip-media-check",
+        action="store_true",
+        help="Skip per-frame path.exists() checks (avoids millions of NFS stats on large JSONL).",
+    )
     args = ap.parse_args()
 
     path = Path(args.input).expanduser().resolve()
@@ -148,10 +154,11 @@ def main() -> None:
         print(f"[schema] ERROR: file not found: {path}", file=sys.stderr)
         sys.exit(2)
 
-    total, errors = validate_jsonl(path, args.mode)
+    total, errors = validate_jsonl(path, args.mode, skip_media_check=args.skip_media_check)
     print(f"[schema] file={path}")
     print(f"[schema] mode={args.mode}")
     print(f"[schema] rows_checked={total}")
+    print(f"[schema] skip_media_check={args.skip_media_check}")
     if errors:
         print(f"[schema] INVALID: {len(errors)} issue(s)", file=sys.stderr)
         for msg in errors[:200]:

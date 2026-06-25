@@ -128,7 +128,7 @@ def convert_length_row(row: dict[str, Any], answer: str) -> tuple[dict[str, Any]
         else:
             reasoning_depth = "ANSWER"
     if reasoning_depth == "ANSWER":
-        reasoning = None
+        reasoning = "<DIRECT>None</DIRECT>"
     elif reasoning_depth == "COT":
         text = extract_tag(output, "COT")
         if text is None:

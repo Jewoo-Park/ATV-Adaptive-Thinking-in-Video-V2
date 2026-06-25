@@ -271,11 +271,12 @@ def export_length_rows(
             **media_fields,
         }
 
+        direct_reasoning = "<DIRECT>None</DIRECT>"
         exported.append(
             {
                 **base,
-                "reasoning": None,
-                "output": answer,
+                "reasoning": direct_reasoning,
+                "output": compose_output(direct_reasoning, answer),
                 "reasoning_depth": "ANSWER",
             }
         )

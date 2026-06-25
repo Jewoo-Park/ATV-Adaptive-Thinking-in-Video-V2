@@ -22,7 +22,12 @@ if [[ ! -f "${TRAIN_FILE}" ]]; then
   exit 1
 fi
 
-python3 src/scripts/validate_grpo_jsonl_schema.py --input "${TRAIN_FILE}" --mode perspective
+GRPO_JSONL_SKIP_MEDIA_CHECK="${GRPO_JSONL_SKIP_MEDIA_CHECK:-true}"
+SCHEMA_VALIDATE_ARGS=(--input "${TRAIN_FILE}" --mode perspective)
+if [[ "${GRPO_JSONL_SKIP_MEDIA_CHECK}" == "true" || "${GRPO_JSONL_SKIP_MEDIA_CHECK}" == "1" ]]; then
+  SCHEMA_VALIDATE_ARGS+=(--skip-media-check)
+fi
+python3 src/scripts/validate_grpo_jsonl_schema.py "${SCHEMA_VALIDATE_ARGS[@]}"
 
 if [[ -z "${QWEN_PATH:-}" || -z "${QWEN_BASE_PATH:-}" ]]; then
   echo "[GRPO-PERSPECTIVE-REAL] ERROR: Set QWEN_PATH and QWEN_BASE_PATH before launch." >&2

@@ -70,7 +70,7 @@ class GRPOVideoScriptArguments(ScriptArguments):
         metadata={"help": "Alpha multiplier for strategy bonus: final = base + alpha * (strategy_mean - mean(strategy_means))."},
     )
     strategy_bonus_threshold: float = field(
-        default=0.10,
+        default=0.05,
         metadata={
             "help": "If (best_strategy_mean - second_best_strategy_mean) < threshold for a prompt group, "
             "apply no strategy bonus and leave effective_best_strategy unset."
@@ -274,25 +274,31 @@ PERSPECTIVE_SYSTEM_PROMPT = """You are a video multiple-choice question answerin
 Choose the appropriate reasoning perspective.
 
 Perspective selection rule:
-Choose the perspective based on the evidence needed to answer correctly.
-Choose Abstract when the answer depends on the overall scene, object identity, or high-level meaning.
-Choose Temporal when the answer depends on order, timing, sequence, or change over time.
-Choose Spatiotemporal when the answer depends on motion, interaction, object location, or spatial relations across frames.
+Choose the perspective based on the kind of visual evidence needed to answer correctly.
+Choose Abstract when the answer depends on scene gist, object identity, category, or high-level semantic meaning.
+Choose Temporal when the answer depends on event order, timing, sequence, duration, or how states change over time.
+Choose Spatiotemporal when the answer depends on motion, spatial layout, object location, interactions, or relations that evolve across frames.
 
 Allowed outputs are exactly one of:
 
 Abstract:
-Use for conceptual, object-level, scene-level, or high-level semantic reasoning.
+Use when the answer can be determined from high-level scene understanding without detailed motion tracking or fine-grained event ordering.
+Use for object identity, category, scene type, overall activity, attributes, roles, or semantic comparisons visible from a coarse reading of the video.
+Use when the key evidence is what is present or what kind of thing is happening, rather than precisely when it happens or where it moves.
 <ABSTRACT>...</ABSTRACT>
 <ANSWER>X</ANSWER>
 
 Temporal:
-Use for questions involving before/after relations, ordering, sequence, duration, or changes over time.
+Use when the answer depends on when something happens, the order of events, duration, repetition, or how the situation evolves across time.
+Use for before/after relations, sequencing, counting events, onset or offset of actions, phases of a process, or identifying which moment matches a description.
+Use when a single frame is insufficient and the critical evidence is how states change from earlier to later frames.
 <TEMPORAL>...</TEMPORAL>
 <ANSWER>X</ANSWER>
 
 Spatiotemporal:
-Use for questions involving motion, spatial relations over time, object movement, physical interactions, or evidence that requires both spatial and temporal grounding.
+Use when the answer requires jointly reasoning about where things are and how they move, interact, or change position over time.
+Use for trajectories, relative positions, approaching or leaving, directional movement, physical interactions, and fine-grained motion grounded in frame layout.
+Use when neither abstract scene gist nor temporal order alone is enough—you must connect spatial relations to temporal change across multiple frames.
 <SPATIOTEMPORAL>...</SPATIOTEMPORAL>
 <ANSWER>X</ANSWER>
 
@@ -628,7 +634,8 @@ def main(script_args, training_args, model_args):
         reward_funcs=reward_funcs,
         args=training_args,
         train_dataset=dataset["train"],
-        eval_dataset=dataset["test"] if "test" in dataset and training_args.eval_strategy != "no" else None,
+        # Keep test split for periodic forced-strategy eval even when HF eval_strategy is "no".
+        eval_dataset=dataset["test"] if "test" in dataset else None,
         peft_config=get_peft_config(model_args),
         attn_implementation=model_args.attn_implementation,
         max_pixels=script_args.max_pixels,

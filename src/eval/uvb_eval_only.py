@@ -130,25 +130,31 @@ PERSPECTIVE_SYSTEM_PROMPT = """You are a video multiple-choice question answerin
 Choose the appropriate reasoning perspective.
 
 Perspective selection rule:
-Choose the perspective based on the evidence needed to answer correctly.
-Choose Abstract when the answer depends on the overall scene, object identity, or high-level meaning.
-Choose Temporal when the answer depends on order, timing, sequence, or change over time.
-Choose Spatiotemporal when the answer depends on motion, interaction, object location, or spatial relations across frames.
+Choose the perspective based on the kind of visual evidence needed to answer correctly.
+Choose Abstract when the answer depends on scene gist, object identity, category, or high-level semantic meaning.
+Choose Temporal when the answer depends on event order, timing, sequence, duration, or how states change over time.
+Choose Spatiotemporal when the answer depends on motion, spatial layout, object location, interactions, or relations that evolve across frames.
 
 Allowed outputs are exactly one of:
 
 Abstract:
-Use for conceptual, object-level, scene-level, or high-level semantic reasoning.
+Use when the answer can be determined from high-level scene understanding without detailed motion tracking or fine-grained event ordering.
+Use for object identity, category, scene type, overall activity, attributes, roles, or semantic comparisons visible from a coarse reading of the video.
+Use when the key evidence is what is present or what kind of thing is happening, rather than precisely when it happens or where it moves.
 <ABSTRACT>...</ABSTRACT>
 <ANSWER>X</ANSWER>
 
 Temporal:
-Use for questions involving before/after relations, ordering, sequence, duration, or changes over time.
+Use when the answer depends on when something happens, the order of events, duration, repetition, or how the situation evolves across time.
+Use for before/after relations, sequencing, counting events, onset or offset of actions, phases of a process, or identifying which moment matches a description.
+Use when a single frame is insufficient and the critical evidence is how states change from earlier to later frames.
 <TEMPORAL>...</TEMPORAL>
 <ANSWER>X</ANSWER>
 
 Spatiotemporal:
-Use for questions involving motion, spatial relations over time, object movement, physical interactions, or evidence that requires both spatial and temporal grounding.
+Use when the answer requires jointly reasoning about where things are and how they move, interact, or change position over time.
+Use for trajectories, relative positions, approaching or leaving, directional movement, physical interactions, and fine-grained motion grounded in frame layout.
+Use when neither abstract scene gist nor temporal order alone is enough—you must connect spatial relations to temporal change across multiple frames.
 <SPATIOTEMPORAL>...</SPATIOTEMPORAL>
 <ANSWER>X</ANSWER>
 
@@ -239,6 +245,18 @@ def main() -> None:
         choices=("length", "perspective"),
         help="Strict output mode. Length allows ANSWER/COT/LONG_COT; perspective allows ABSTRACT/TEMPORAL/SPATIOTEMPORAL.",
     )
+    parser.add_argument(
+        "--system-prompt-file",
+        type=str,
+        default="",
+        help="Optional Python file defining LENGTH_STRICTER_PROMPT / PERSPECTIVE_STRICTER_PROMPT or SYSTEM_PROMPT override.",
+    )
+    parser.add_argument(
+        "--stop-strings",
+        type=str,
+        default="",
+        help="Comma-separated stop strings for generation (vLLM SamplingParams.stop).",
+    )
     args = parser.parse_args()
     run_id = f"eval_{int(time.time())}"
 
@@ -293,7 +311,13 @@ def main() -> None:
             enforce_eager=True,
         )
         print("[uvb_eval] backend=vllm (loaded); running inference …", flush=True)
-        sp = SamplingParams(temperature=args.temperature, max_tokens=args.max_completion_length, n=1)
+        _stop = [s.strip() for s in args.stop_strings.split(",") if s.strip()] or None
+        sp = SamplingParams(
+            temperature=args.temperature,
+            max_tokens=args.max_completion_length,
+            n=1,
+            stop=_stop,
+        )
     else:
         print("[uvb_eval] backend=hf (vLLM unavailable or disabled); running inference …", flush=True)
         import torch
@@ -331,6 +355,26 @@ def main() -> None:
     format_class_counts = Counter()
     malformed_type_counts = Counter()
     system_prompt = system_prompt_for_task(args.reasoning_task_type)
+    if args.system_prompt_file:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("custom_system_prompt", args.system_prompt_file)
+        if spec is None or spec.loader is None:
+            raise SystemExit(f"Could not load --system-prompt-file: {args.system_prompt_file}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        if args.reasoning_task_type == "length":
+            system_prompt = getattr(
+                mod,
+                "LENGTH_STRICTER_PROMPT",
+                getattr(mod, "LENGTH_SYSTEM_PROMPT", system_prompt),
+            )
+        else:
+            system_prompt = getattr(
+                mod,
+                "PERSPECTIVE_STRICTER_PROMPT",
+                getattr(mod, "PERSPECTIVE_SYSTEM_PROMPT", system_prompt),
+            )
 
     _loop = enumerate(rows)
     if not args.disable_progress:

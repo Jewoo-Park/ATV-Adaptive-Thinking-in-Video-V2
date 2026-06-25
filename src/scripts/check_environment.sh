@@ -24,7 +24,7 @@ if [[ "${GRPO_CHECK_NO_GPU_LC}" == "1" || "${GRPO_CHECK_NO_GPU_LC}" == "true" ||
   GPU_STRICT=false
 fi
 
-MERGED_MODEL_DIR="${MERGED_MODEL_DIR:-sft/outputs/qwen25vl7b_lora_merged_length}"
+MERGED_MODEL_DIR="${MERGED_MODEL_DIR:-/scratch/users/ntu/n2500182/models/qwen25vl3b_lora_merged_length}"
 
 echo "================================================"
 echo "GRPO_Video_2 Environment Check"

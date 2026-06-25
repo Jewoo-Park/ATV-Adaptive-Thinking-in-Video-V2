@@ -812,7 +812,7 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
         balanced_strategy_rollout: bool = False,
         rollouts_per_strategy: int = 3,
         strategy_bonus_scale: float = 0.2,
-        strategy_bonus_threshold: float = 0.10,
+        strategy_bonus_threshold: float = 0.05,
         tie_break_bonus_scale: float = 0.0,
         log_strategy_metrics: bool = True,
         strategy_debug_log_path: str = "",
@@ -946,6 +946,11 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
             # If PEFT is used, the reference model is not needed since the adapter can be disabled
             # to revert to the initial model.
             self.ref_model = None
+            logger.info(
+                "[GRPO] PEFT mode: reference log-probs via disable_adapter() on the loaded base "
+                "(model_name_or_path=%s). Adapter-off weights must equal the SFT merged base.",
+                model_id,
+            )
 
         # Processing class
         if processing_class is None:
@@ -1170,6 +1175,10 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
             1, int(os.getenv("VLLM_MAX_FRAMES", "8"))
         )
         self._grpo_image_fallback_events = 0
+        self._grpo_step_image_fallback_count = 0
+        self._grpo_step_frame_slots = 0
+        self._grpo_step_mm_mismatch_rows = 0
+        self._grpo_step_mm_row_forward_total = 0
 
         super().__init__(
             model=model,
@@ -1356,8 +1365,24 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
             if isinstance(reward_func, PreTrainedModel):
                 self.reward_funcs[i] = self.accelerator.prepare_model(reward_func, evaluation_mode=True)
 
-    def _log_image_fallback(self, message: str) -> None:
-        """Rate-limited warning so bad shards do not flood logs."""
+    def _reset_step_mm_health_counters(self) -> None:
+        self._grpo_step_image_fallback_count = 0
+        self._grpo_step_frame_slots = 0
+        self._grpo_step_mm_mismatch_rows = 0
+        self._grpo_step_mm_row_forward_total = 0
+
+    def _note_frame_load_slot(self, count: int = 1) -> None:
+        if count > 0:
+            self._grpo_step_frame_slots += count
+
+    def _record_image_placeholder_fallback(
+        self, count: int = 1, message: str | None = None
+    ) -> None:
+        if count <= 0:
+            return
+        self._grpo_step_image_fallback_count += count
+        if message is None:
+            return
         self._grpo_image_fallback_events += 1
         cap = int(os.getenv("GRPO_IMAGE_FALLBACK_MAX_LOG", "30"))
         every = max(1, int(os.getenv("GRPO_IMAGE_FALLBACK_LOG_EVERY", "200")))
@@ -1368,6 +1393,28 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                 UserWarning,
                 stacklevel=2,
             )
+
+    def _log_image_fallback(self, message: str) -> None:
+        """Rate-limited warning so bad shards do not flood logs."""
+        self._record_image_placeholder_fallback(1, message)
+
+    def _append_step_mm_health_metrics(self) -> None:
+        device = self.accelerator.device
+
+        def _sum_across_processes(value: float) -> float:
+            tensor = torch.tensor([value], device=device, dtype=torch.float32)
+            return float(self.accelerator.gather_for_metrics(tensor).sum().item())
+
+        mm_skip = _sum_across_processes(float(self._grpo_step_mm_mismatch_rows))
+        mm_total = _sum_across_processes(float(self._grpo_step_mm_row_forward_total))
+        fallback_count = _sum_across_processes(float(self._grpo_step_image_fallback_count))
+        frame_slots = _sum_across_processes(float(self._grpo_step_frame_slots))
+        self._metrics["mm/mm_mismatch_zero_logprob_row_rate"].append(
+            mm_skip / mm_total if mm_total > 0 else 0.0
+        )
+        self._metrics["mm/image_placeholder_fallback_rate"].append(
+            fallback_count / frame_slots if frame_slots > 0 else 0.0
+        )
 
     def _get_cached_llm_param_keys(self, llm_model: Any) -> set[str]:
         llm_obj_id = id(llm_model)
@@ -1748,6 +1795,7 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
         if max_frames is None:
             max_frames = self.vllm_max_frames
         if isinstance(item, str) or isinstance(item, os.PathLike):
+            self._note_frame_load_slot()
             path = os.fspath(item)
             try:
                 if not os.path.isfile(path):
@@ -1761,10 +1809,12 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                 return self._make_placeholder_pil()
         if isinstance(item, list):
             if len(item) == 0:
+                self._note_frame_load_slot()
                 self._log_image_fallback("empty frames list; using one placeholder frame")
                 return [self._make_placeholder_pil()]
             frames = []
             for x in item:
+                self._note_frame_load_slot()
                 try:
                     frames.append(self._load_image_item(x, max_frames=None))
                 except Exception as exc:
@@ -1795,11 +1845,13 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                 frames = frames[::step][:max_frames]
             return frames
         if isinstance(item, Image.Image):
+            self._note_frame_load_slot()
             try:
                 return self._resize_image_to_pixel_bounds(item)
             except Exception as exc:
                 self._log_image_fallback(f"PIL resize/preprocess failed: {exc!r}")
                 return self._make_placeholder_pil()
+        self._note_frame_load_slot()
         self._log_image_fallback(
             f"image_vllm has unsupported type {type(item).__name__}; using placeholder"
         )
@@ -1841,8 +1893,12 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                 "yes",
             ):
                 raise
-            self._log_image_fallback(
-                f"processing_class failed ({exc!r}); retrying with placeholder frames only"
+            frame_slots = sum(
+                (len(im) if isinstance(im, list) and im else 1) for im in images
+            )
+            self._record_image_placeholder_fallback(
+                frame_slots,
+                f"processing_class failed ({exc!r}); retrying with placeholder frames only",
             )
             safe_images = []
             for im in images:
@@ -1892,8 +1948,128 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
         msg = str(exc)
         return (
             "Image features and image tokens do not match" in msg
-            or ("tokens:" in msg and "features" in msg and "image" in msg.lower())
+            or "image tokens do not match" in msg.lower()
         )
+
+    def _mm_image_token_count(self, input_ids_1: torch.Tensor) -> int:
+        tok = getattr(self.processing_class, "image_token_id", None)
+        if tok is None:
+            tok = getattr(self.processing_class.tokenizer, "image_token_id", None)
+        if tok is None:
+            return -1
+        return int((input_ids_1 == tok).sum().item())
+
+    def _mm_feature_count(self, image_grid_thw_single: torch.Tensor, *, model=None) -> int:
+        merge_length = self._qwen25vl_merge_length(model=model)
+        return int((image_grid_thw_single.prod(dim=-1) // merge_length).sum().item())
+
+    def _local_mm_preflight_mismatch_rows(
+        self,
+        input_ids,
+        pixel_values,
+        image_grid_thw,
+        *,
+        model=None,
+    ) -> int:
+        """Count rows where image-token count != vision feature count (no model forward)."""
+        B = input_ids.shape[0]
+        bad = 0
+        for i in range(B):
+            ids_1 = input_ids[i : i + 1]
+            _, thw_row = self._slice_mm_inputs_for_row(
+                pixel_values, image_grid_thw, i, B, model=model
+            )
+            tok_n = self._mm_image_token_count(ids_1)
+            feat_n = self._mm_feature_count(thw_row, model=model)
+            if tok_n >= 0 and feat_n >= 0 and tok_n != feat_n:
+                bad += 1
+                self._log_mm_mismatch_row_context(
+                    i,
+                    B,
+                    ValueError(
+                        f"Image features and image tokens do not match: "
+                        f"tokens: {tok_n}, features {feat_n}"
+                    ),
+                )
+        return bad
+
+    def _qwen25vl_merge_length(self, model=None) -> int:
+        """Patches per image = prod(grid_thw) // merge_length."""
+        merge_size = 2
+        if model is None:
+            try:
+                model = self.accelerator.unwrap_model(self.model)
+            except Exception:
+                model = self.model
+        visual = getattr(model, "visual", None)
+        if visual is None and hasattr(model, "model"):
+            visual = getattr(model.model, "visual", None)
+        if visual is not None and hasattr(visual, "spatial_merge_size"):
+            merge_size = int(visual.spatial_merge_size)
+        return merge_size * merge_size
+
+    @staticmethod
+    def _images_per_mm_batch_row(image_grid_thw: torch.Tensor, batch_size: int) -> int:
+        if batch_size <= 0:
+            return 0
+        return int(image_grid_thw.shape[0] // batch_size)
+
+    def _slice_mm_inputs_for_row(
+        self,
+        pixel_values: torch.Tensor,
+        image_grid_thw: torch.Tensor,
+        row_index: int,
+        batch_size: int,
+        *,
+        model=None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Slice flattened Qwen2.5-VL pixel_values / image_grid_thw for one batch row.
+
+        Balanced strategy rollout builds B separate processor rows (one per forced-strategy
+        slot). Using pixel_values[::B] (row 0 only) mismatches cot/long_cot prompts.
+        """
+        num_images = self._images_per_mm_batch_row(image_grid_thw, batch_size)
+        img_start = row_index * num_images
+        img_end = img_start + num_images
+        thw_row = image_grid_thw[img_start:img_end]
+
+        # pixel_values is indexed by FULL vision patches (prod(grid_thw)), not by the
+        # spatial-merged token count (prod // merge_length). Using the merged count here
+        # under-slices pixel_values by merge_length and corrupts the visual forward
+        # (window_index out of bounds -> CUDA device-side assert). Merged count is only
+        # for image-token vs feature comparison in _mm_feature_count.
+        patch_counts = image_grid_thw.prod(dim=-1).tolist()
+        patch_start = sum(patch_counts[:img_start])
+        patch_end = sum(patch_counts[:img_end])
+        pv_row = pixel_values[patch_start:patch_end]
+        return pv_row, thw_row
+
+    def _any_rank_mm_mismatch_this_step(self) -> bool:
+        """True if any process saw an MM mismatch row this step (DDP step-skip guard)."""
+        local = float(self._grpo_step_mm_mismatch_rows)
+        if not getattr(self.accelerator, "num_processes", 1) > 1:
+            return local > 0
+        t = torch.tensor([local], device=self.accelerator.device, dtype=torch.float32)
+        reduced = self.accelerator.gather_for_metrics(t)
+        return bool((reduced > 0).any().item())
+
+    def _log_mm_mismatch_row_context(self, row_index: int, batch_size: int, exc: Exception) -> None:
+        ctx = getattr(self, "_step_mm_row_debug", None)
+        if not ctx or row_index >= len(ctx):
+            return
+        info = ctx[row_index]
+        self._log_image_fallback(
+            "[MM_MISMATCH_CTX] "
+            f"step={self.state.global_step} row={row_index}/{batch_size} "
+            f"forced_strategy={info.get('forced_strategy')} "
+            f"solution={str(info.get('solution', ''))[:80]} "
+            f"problem={str(info.get('problem', ''))[:120]} "
+            f"error={exc}"
+        )
+
+    @staticmethod
+    def _zero_row_logprobs(logits_to_keep: int, device: torch.device) -> torch.Tensor:
+        return torch.zeros((logits_to_keep,), device=device, dtype=torch.float32)
 
     @staticmethod
     def _is_deepspeed_timer_assertion_error(exc: Exception) -> bool:
@@ -1959,32 +2135,43 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
         logits_to_keep,
     ):
         B = input_ids.shape[0]
-        # All B completions share the same visual input (pixel_values was built with
-        # repeat_interleave(B): [p0,p0,..,p0, p1,p1,..,p1, ...]).
-        # Recover the original single-copy patches by striding with step B.
-        pv_single = pixel_values[::B].to(model.device)
-        thw_single = image_grid_thw[::B].to(device=model.device)
-
-        # Stacking B separate forwards in one autograd graph retains all activations at once and OOMs on 7B VL + long
-        # context. Checkpoint each row so only one forward's activations live at a time (recompute on backward).
-        # Activation checkpointing is only useful when gradients are enabled.
-        # In no_grad/inference paths (e.g. ref_per_token_logps), forcing checkpoint
-        # only adds Python/runtime overhead without memory benefit.
-        # DeepSpeed + per-row torch.checkpoint can rarely trip fwd_microstep timers (AssertionError).
-        # Never disable row checkpoint for VRAM (9 rows without ckpt OOMs); reset the stuck timer and retry.
+        self._grpo_step_mm_row_forward_total += B
+        preflight_bad = self._local_mm_preflight_mismatch_rows(
+            input_ids, pixel_values, image_grid_thw, model=model
+        )
+        if preflight_bad > 0:
+            self._grpo_step_mm_mismatch_rows += preflight_bad
+        if self._any_rank_mm_mismatch_this_step():
+            warnings.warn(
+                f"[MM_MISMATCH_STEP_SKIP] step={self.state.global_step} "
+                "preflight token/feature mismatch on at least one rank; "
+                "skipping all row forwards for DDP safety.",
+                UserWarning,
+                stacklevel=2,
+            )
+            return torch.zeros(
+                (B, logits_to_keep),
+                device=input_ids.device,
+                dtype=torch.float32,
+            )
         row_ckpt_env = os.getenv("GRPO_ROW_ACTIVATION_CHECKPOINT", "true").strip().lower() == "true"
         use_row_ckpt = row_ckpt_env and torch.is_grad_enabled()
         per_token_logps = []
         for i in range(B):
             ids_1 = input_ids[i : i + 1]
             mask_1 = attention_mask[i : i + 1]
+            pv_row, thw_row = self._slice_mm_inputs_for_row(
+                pixel_values, image_grid_thw, i, B, model=model
+            )
+            pv_row = pv_row.to(model.device)
+            thw_row = thw_row.to(device=model.device)
             try:
                 row = self._forward_row_logprobs_maybe_checkpointed(
                     model,
                     ids_1,
                     mask_1,
-                    pv_single,
-                    thw_single,
+                    pv_row,
+                    thw_row,
                     logits_to_keep,
                     use_row_ckpt=use_row_ckpt,
                 )
@@ -1998,17 +2185,15 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                 if skip_mm_row and self._is_mm_token_feature_mismatch_error(exc):
                     skip_count = int(getattr(self, "_mm_row_skip_count", 0)) + 1
                     self._mm_row_skip_count = skip_count
+                    self._grpo_step_mm_mismatch_rows += 1
+                    self._log_mm_mismatch_row_context(i, B, exc)
                     self._log_image_fallback(
                         "[MM_MISMATCH_SKIP] "
                         f"step={self.state.global_step} row={i}/{B} "
                         f"logits_to_keep={logits_to_keep} total_skipped={skip_count} "
                         f"error={exc}"
                     )
-                    row = torch.zeros(
-                        (logits_to_keep,),
-                        device=ids_1.device,
-                        dtype=torch.float32,
-                    )
+                    row = self._zero_row_logprobs(logits_to_keep, ids_1.device)
                 elif use_row_ckpt and self._is_deepspeed_timer_assertion_error(exc):
                     self._reset_deepspeed_fwd_microstep_timer(model)
                     self._log_image_fallback(
@@ -2020,14 +2205,27 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                         model,
                         ids_1,
                         mask_1,
-                        pv_single,
-                        thw_single,
+                        pv_row,
+                        thw_row,
                         logits_to_keep,
                         use_row_ckpt=True,
                     )
                 else:
                     raise
             per_token_logps.append(row)
+
+        if self._any_rank_mm_mismatch_this_step():
+            warnings.warn(
+                f"[MM_MISMATCH_STEP_SKIP] step={self.state.global_step} "
+                "at least one rank skipped MM rows; zeroing all row logprobs for DDP safety.",
+                UserWarning,
+                stacklevel=2,
+            )
+            return torch.zeros(
+                (B, logits_to_keep),
+                device=input_ids.device,
+                dtype=torch.float32,
+            )
         return torch.stack(per_token_logps)
 
     def _apply_strategy_bonus(
@@ -2084,6 +2282,7 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
             float(apply_mask.mean().item())
         )
         self._metrics["strategy/strategy_margin_mean"].append(float(margin.mean().item()))
+        self._metrics["strategy/strategy_margin_max"].append(float(margin.max().item()))
 
         # Per-strategy average reward across all prompt groups in this step.
         per_strategy_mean = strategy_mean.mean(dim=0)  # (S,)
@@ -2294,6 +2493,7 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
     def _prepare_inputs(
         self, inputs: dict[str, Union[torch.Tensor, Any]]
     ) -> dict[str, Union[torch.Tensor, Any]]:
+        self._reset_step_mm_health_counters()
         t_prepare_start = time.perf_counter()
         t_data_loading = 0.0
         t_processor = 0.0
@@ -2325,10 +2525,19 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
                     effective_inputs.append(ex_copy)
                     strategy_ids_local.append(self._strategy_index_per_slot[slot_idx])
             self._step_strategy_ids_local = strategy_ids_local
+            self._step_mm_row_debug = [
+                {
+                    "forced_strategy": ex.get("forced_strategy"),
+                    "solution": ex.get("solution", ""),
+                    "problem": ex.get("problem", ""),
+                }
+                for ex in effective_inputs
+            ]
         else:
             _sampling_n = self.num_generations
             effective_inputs = inputs
             self._step_strategy_ids_local = None
+            self._step_mm_row_debug = None
 
         prompts = [x["prompt"] for x in effective_inputs]
         # Build reduced-frame examples first so chat template placeholder count
@@ -2653,18 +2862,31 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
             _strategy_log = None
 
         # Compute grouped-wise rewards (uses final reward when balanced, base reward otherwise).
-        mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
-        std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
+        rewards_grouped = rewards.view(-1, self.num_generations)
+        mean_grouped_rewards = rewards_grouped.mean(dim=1)
+        std_grouped_rewards = rewards_grouped.std(dim=1)
 
         # Normalize the rewards to compute the advantages
-        mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(
+        mean_grouped_rewards_exp = mean_grouped_rewards.repeat_interleave(
             self.num_generations, dim=0
         )
-        std_grouped_rewards = std_grouped_rewards.repeat_interleave(
+        std_grouped_rewards_exp = std_grouped_rewards.repeat_interleave(
             self.num_generations, dim=0
         )
-        advantages = (rewards - mean_grouped_rewards) / (std_grouped_rewards + 1e-4)
+        advantages = (rewards - mean_grouped_rewards_exp) / (std_grouped_rewards_exp + 1e-4)
         advantages_global = advantages
+
+        # Advantage / group-reward statistics (instability diagnostics).
+        low_std_thr = 0.05
+        self._metrics["advantage/group_reward_std_mean"].append(float(std_grouped_rewards.mean().item()))
+        self._metrics["advantage/group_reward_std_min"].append(float(std_grouped_rewards.min().item()))
+        self._metrics["advantage/low_std_group_rate"].append(
+            float((std_grouped_rewards < low_std_thr).float().mean().item())
+        )
+        adv_abs = advantages_global.detach().abs()
+        self._metrics["advantage/abs_mean"].append(float(adv_abs.mean().item()))
+        self._metrics["advantage/abs_max"].append(float(adv_abs.max().item()))
+        self._metrics["advantage/epsilon"].append(1e-4)
 
         # Slice to keep only the local part of the data
         process_slice = slice(
@@ -2685,6 +2907,8 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
 
         self._metrics["reward"].append(rewards.mean().item())
         self._metrics["reward_std"].append(std_grouped_rewards.mean().item())
+        self._metrics["reward/base_mean"].append(float(base_rewards.mean().item()))
+        self._metrics["reward/base_std"].append(float(base_rewards.std().item()))
 
         if self.balanced_strategy_rollout and _strategy_log is not None and self.log_strategy_metrics:
             self._log_strategy_metrics(base_rewards, _strategy_log)
@@ -2777,6 +3001,9 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
             logits_to_keep,
         )
 
+        if self._any_rank_mm_mismatch_this_step():
+            return torch.tensor(0.0, device=prompt_ids.device, requires_grad=True)
+
         # Compute the KL divergence between the model and the reference model
         ref_per_token_logps = inputs["ref_per_token_logps"]
         per_token_kl = (torch.exp(ref_per_token_logps - per_token_logps)- (ref_per_token_logps - per_token_logps)- 1)
@@ -2796,12 +3023,19 @@ class Qwen2VLGRPOVLLMTrainerModified(Trainer):
         )
         self._metrics["completion_length"].append(completion_length)
 
-        mean_kl = (
-            (per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1)
-        ).mean()
-        self._metrics["kl"].append(
-            self.accelerator.gather_for_metrics(mean_kl).mean().item()
-        )
+        per_seq_kl = (per_token_kl * completion_mask).sum(dim=1) / completion_mask.sum(dim=1).clamp(min=1)
+        gathered_kl = self.accelerator.gather_for_metrics(per_seq_kl)
+        kl_finite = gathered_kl[torch.isfinite(gathered_kl)]
+        if kl_finite.numel() > 0:
+            self._metrics["kl"].append(float(kl_finite.mean().item()))
+            self._metrics["kl/max"].append(float(kl_finite.max().item()))
+            self._metrics["kl/p95"].append(float(torch.quantile(kl_finite.float(), 0.95).item()))
+        else:
+            self._metrics["kl"].append(float("nan"))
+            self._metrics["kl/max"].append(float("nan"))
+            self._metrics["kl/p95"].append(float("nan"))
+        self._metrics["kl/beta"].append(float(self.beta))
+        self._append_step_mm_health_metrics()
 
         self._timing_forward_s = time.perf_counter() - t0
         return loss

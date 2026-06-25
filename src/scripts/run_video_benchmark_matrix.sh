@@ -1,22 +1,23 @@
 #!/usr/bin/env bash
 # Run UVB / VideoMMMU / MMVU eval for three weight variants:
-#   1) Backbone Qwen2.5-VL-7B-Instruct
+#   1) Backbone Qwen2.5-VL-3B-Instruct
 #   2) SFT merged full weights (backbone + SFT LoRA merged)
 #   3) SFT + GRPO merged full weights (backbone + SFT + GRPO LoRA merged)
 #
 # Usage (on a GPU node, after activating .venv_grpo or equivalent):
-#   export MODEL_BASE=/scratch/users/ntu/n2500182/models/Qwen2.5-VL-7B-Instruct
-#   export MODEL_SFT_MERGED=/scratch/users/ntu/n2500182/models/qwen25vl7b_lora_merged_length
-#   export MODEL_SFT_GRPO_MERGED=/scratch/users/ntu/n2500182/models/video_r1_uvb_grpo_answer_only_lora_merged_ckpt1500
-#   REASONING_TASK_TYPE=length bash src/scripts/run_video_benchmark_matrix.sh
+#   REASONING_TASK_TYPE=length bash src/scripts/run_video_benchmark_matrix_length.sh
+#   REASONING_TASK_TYPE=perspective bash src/scripts/run_video_benchmark_matrix_perspective.sh
 #
-# Perspective model evaluation (must set mode explicitly):
-#   REASONING_TASK_TYPE=perspective bash src/scripts/run_video_benchmark_matrix.sh
+# Defaults (3B, task-aware — override only if needed):
+#   MODEL_BASE=/scratch/users/ntu/n2500182/models/Qwen2.5-VL-3B-Instruct
+#   MODEL_SFT_MERGED=/scratch/users/ntu/n2500182/models/qwen25vl3b_lora_merged_{length|perspective}
+#   MODEL_SFT_GRPO_MERGED=/scratch/users/ntu/n2500182/models/qwen25vl3b_grpo_{length|perspective}_8f_step3000_merged
 #
 # Optional: PROCESSOR_PATH (default = MODEL_BASE), BENCH_DEVICE (default cuda:0),
 #           PYTHON_BIN, GPU_MEM_UTIL (default 0.25, matches VLLM_GPU_UTIL in GRPO training),
 #           BENCH_TEMPERATURE (default 0.8), FRAMES_PER_SAMPLE (default 16), BENCH_EVAL_EXTRA.
-# Eval always uses the full test JSONL (no max-samples in this launcher).
+#           BENCH_MAX_SAMPLES (optional): if set, pass --max-samples for a quick smoke subset.
+# Eval uses the full test JSONL unless BENCH_MAX_SAMPLES is set.
 
 set -euo pipefail
 
@@ -87,9 +88,28 @@ if [[ "${_force_hf_backend}" -eq 0 && "${_vllm_qwen_rc}" -ne 0 ]]; then
   exit 2
 fi
 
-MODEL_BASE="${MODEL_BASE:-/scratch/users/ntu/n2500182/models/Qwen2.5-VL-7B-Instruct}"
-MODEL_SFT_MERGED="${MODEL_SFT_MERGED:-/scratch/users/ntu/n2500182/models/qwen25vl7b_lora_merged_length}"
-MODEL_SFT_GRPO_MERGED="${MODEL_SFT_GRPO_MERGED:-/scratch/users/ntu/n2500182/models/video_r1_uvb_grpo_answer_only_lora_merged_ckpt1500}"
+REASONING_TASK_TYPE="${REASONING_TASK_TYPE:-length}"
+REASONING_TASK_TYPE="$(printf '%s' "${REASONING_TASK_TYPE}" | tr '[:upper:]' '[:lower:]')"
+case "${REASONING_TASK_TYPE}" in
+  length|perspective) ;;
+  *)
+    echo "[BENCH-MATRIX] ERROR: REASONING_TASK_TYPE must be length or perspective (got ${REASONING_TASK_TYPE})" >&2
+    exit 1
+    ;;
+esac
+
+_SCRATCH_MODELS="/scratch/users/ntu/n2500182/models"
+MODEL_BASE="${MODEL_BASE:-${_SCRATCH_MODELS}/Qwen2.5-VL-3B-Instruct}"
+MODEL_SFT_MERGED="${MODEL_SFT_MERGED:-${_SCRATCH_MODELS}/qwen25vl3b_lora_merged_${REASONING_TASK_TYPE}}"
+case "${REASONING_TASK_TYPE}" in
+  length)
+    _default_grpo_merged="${_SCRATCH_MODELS}/qwen25vl3b_grpo_length_8f_step3000_merged"
+    ;;
+  perspective)
+    _default_grpo_merged="${_SCRATCH_MODELS}/qwen25vl3b_grpo_perspective_8f_step3000_merged"
+    ;;
+esac
+MODEL_SFT_GRPO_MERGED="${MODEL_SFT_GRPO_MERGED:-${_default_grpo_merged}}"
 PROCESSOR_PATH="${PROCESSOR_PATH:-${MODEL_BASE}}"
 BENCH_DEVICE="${BENCH_DEVICE:-cuda:0}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.25}"
@@ -101,15 +121,6 @@ mkdir -p "${SUMMARY_DIR}"
 UVB_JSONL="${UVB_JSONL:-${REPO_ROOT}/data/urban_video_bench/grpo/uvb_grpo_test_strict.jsonl}"
 VIDEOMMMU_JSONL="${VIDEOMMMU_JSONL:-${REPO_ROOT}/data/video_mmmu/grpo/videommmu_grpo_test_strict.jsonl}"
 MMVU_JSONL="${MMVU_JSONL:-${REPO_ROOT}/data/mmvu/grpo/mmvu_grpo_test_strict.jsonl}"
-REASONING_TASK_TYPE="${REASONING_TASK_TYPE:-length}"
-REASONING_TASK_TYPE="$(printf '%s' "${REASONING_TASK_TYPE}" | tr '[:upper:]' '[:lower:]')"
-case "${REASONING_TASK_TYPE}" in
-  length|perspective) ;;
-  *)
-    echo "[BENCH-MATRIX] ERROR: REASONING_TASK_TYPE must be length or perspective (got ${REASONING_TASK_TYPE})" >&2
-    exit 1
-    ;;
-esac
 
 PROC_ARGS=()
 if [[ -n "${PROCESSOR_PATH}" ]]; then
@@ -152,6 +163,11 @@ _run_eval() {
   echo "  log:   ${log}"
   echo "================================================================================"
 
+  local max_samples_args=()
+  if [[ -n "${BENCH_MAX_SAMPLES:-}" ]]; then
+    max_samples_args=(--max-samples "${BENCH_MAX_SAMPLES}")
+  fi
+
   set +e
   "${PYTHON_BIN}" "${REPO_ROOT}/${script}" \
     --model "${model_path}" \
@@ -162,6 +178,7 @@ _run_eval() {
     --temperature "${BENCH_TEMPERATURE}" \
     --frames-per-sample "${FRAMES_PER_SAMPLE}" \
     --reasoning-task-type "${REASONING_TASK_TYPE}" \
+    "${max_samples_args[@]}" \
     ${BENCH_EVAL_EXTRA:-} \
     2>&1 | tee "${log}"
   local rc=${PIPESTATUS[0]}
@@ -182,6 +199,7 @@ echo "[BENCH-MATRIX] BENCH_DEVICE=${BENCH_DEVICE}"
 echo "[BENCH-MATRIX] GPU_MEM_UTIL=${GPU_MEM_UTIL}"
 echo "[BENCH-MATRIX] BENCH_TEMPERATURE=${BENCH_TEMPERATURE}"
 echo "[BENCH-MATRIX] FRAMES_PER_SAMPLE=${FRAMES_PER_SAMPLE}"
+echo "[BENCH-MATRIX] BENCH_MAX_SAMPLES=${BENCH_MAX_SAMPLES:-<full>}"
 echo "[BENCH-MATRIX] PYTHON_BIN=${PYTHON_BIN}"
 echo "[BENCH-MATRIX] REASONING_TASK_TYPE=${REASONING_TASK_TYPE}"
 : > "${SUMMARY_DIR}/exit_codes.txt"

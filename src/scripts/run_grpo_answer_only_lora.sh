@@ -19,8 +19,6 @@ case "${REASONING_TASK_TYPE}" in
 esac
 
 export DEBUG_MODE="true"
-export LOG_PATH="${LOG_PATH:-./logs/video_r1_uvb_grpo_${REASONING_TASK_TYPE}_answer_only_lora.log}"
-mkdir -p ./logs
 
 # Qwen2.5-VL vision + flash-attn rotary: assert fp32 q vs bf16 cos/sin. One-time patch of transformers in the active venv.
 # Set GRPO_APPLY_ROTARY_DTYPE_HOTFIX=false to skip (e.g. read-only site-packages).
@@ -128,6 +126,11 @@ GRPO_TRAIN_VIDEO_ONLY_LC="$(printf '%s' "${GRPO_TRAIN_VIDEO_ONLY}" | tr '[:upper
 
 mkdir -p "${OUTPUT_DIR}"
 
+# Reward debug log (all ranks append when DEBUG_MODE=true). Default beside OUTPUT_DIR so
+# main runs with OUTPUT_DIR on /scratch do not fill home quota.
+export LOG_PATH="${LOG_PATH:-${OUTPUT_DIR}/reward_debug.log}"
+mkdir -p "$(dirname "${LOG_PATH}")"
+
 mkdir -p "${SPLIT_DIR}"
 if [[ ! -s "${TRAIN_SPLIT_FILE}" || ! -s "${EVAL_SPLIT_FILE}" || "${TRAIN_SOURCE}" -nt "${TRAIN_SPLIT_FILE}" || "${TRAIN_SOURCE}" -nt "${EVAL_SPLIT_FILE}" ]]; then
   echo "[VIDEO-GRPO-LORA] creating train/eval split from TRAIN_SOURCE (fraction=${GRPO_EVAL_FRACTION}, seed=${GRPO_EVAL_SPLIT_SEED}, video_only=${GRPO_EVAL_VIDEO_ONLY})"
@@ -188,6 +191,7 @@ echo "[VIDEO-GRPO-LORA] TRAIN_SOURCE=${TRAIN_SOURCE}"
 echo "[VIDEO-GRPO-LORA] TRAIN_FILE=${TRAIN_FILE}"
 echo "[VIDEO-GRPO-LORA] TEST_FILE=${TEST_FILE}"
 echo "[VIDEO-GRPO-LORA] OUTPUT_DIR=${OUTPUT_DIR}"
+echo "[VIDEO-GRPO-LORA] LOG_PATH=${LOG_PATH}"
 echo "[VIDEO-GRPO-LORA] RESUME_FROM_CHECKPOINT=${RESUME_FROM_CHECKPOINT:-<none>}"
 echo "[VIDEO-GRPO-LORA] NUM_GPUS=${NUM_GPUS} (train processes: ${TRAIN_NUM_GPUS}, 1 GPU reserved for vLLM when NUM_GPUS>1)"
 echo "[VIDEO-GRPO-LORA] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
